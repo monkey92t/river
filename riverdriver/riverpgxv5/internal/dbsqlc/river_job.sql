@@ -26,6 +26,11 @@ CREATE TABLE river_job (
     state river_job_state NOT NULL DEFAULT 'available',
     scheduled_at timestamptz NOT NULL DEFAULT now(),
     tags varchar(255)[] NOT NULL DEFAULT '{}',
+    sequence_key text,
+    sequence_position bigint,
+    sequence_continue_on_cancelled boolean,
+    sequence_continue_on_discarded boolean,
+    sequence_resolved_at timestamptz,
     unique_key bytea,
     unique_states bit(8),
     CONSTRAINT finalized_or_finalized_at_null CHECK (
@@ -36,6 +41,47 @@ CREATE TABLE river_job (
     CONSTRAINT queue_length CHECK (char_length(queue) > 0 AND char_length(queue) < 128),
     CONSTRAINT kind_length CHECK (char_length(kind) > 0 AND char_length(kind) < 128)
 );
+
+CREATE TABLE river_sequence_group (
+    key text PRIMARY KEY,
+    next_position bigint NOT NULL DEFAULT 1,
+    mode text NOT NULL DEFAULT 'ordered',
+    blocked_job_id bigint,
+    blocked_position bigint,
+    blocked_reason text,
+    blocked_at timestamptz,
+    next_check_at timestamptz,
+    last_progress_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (char_length(key) > 0 AND char_length(key) < 512),
+    CHECK (next_position > 0),
+    CHECK (mode IN ('ordered', 'blocked', 'bypass')),
+    CHECK (
+        (mode = 'blocked'
+            AND blocked_job_id IS NOT NULL
+            AND blocked_position IS NOT NULL
+            AND blocked_position > 0
+            AND blocked_reason IS NOT NULL
+            AND blocked_reason IN ('cancelled', 'discarded')
+            AND blocked_at IS NOT NULL)
+        OR
+        (mode <> 'blocked'
+            AND blocked_job_id IS NULL
+            AND blocked_position IS NULL
+            AND blocked_reason IS NULL
+            AND blocked_at IS NULL)
+    )
+);
+
+CREATE INDEX river_sequence_group_next_check_idx
+    ON river_sequence_group(next_check_at, key)
+    WHERE next_check_at IS NOT NULL;
+
+-- Preserve fair keyset scanning without visiting idle groups in generic plans.
+CREATE INDEX river_sequence_group_due_key_idx
+    ON river_sequence_group(key)
+    WHERE next_check_at IS NOT NULL;
 
 -- name: JobCancel :one
 WITH locked_job AS (
@@ -165,6 +211,7 @@ WHERE id IN (
             (state = 'completed' AND @completed_do_delete AND finalized_at < @completed_finalized_at_horizon::timestamptz) OR
             (state = 'discarded' AND @discarded_do_delete AND finalized_at < @discarded_finalized_at_horizon::timestamptz)
         )
+        AND (sequence_key IS NULL OR sequence_resolved_at IS NOT NULL)
         AND (
             @queues_excluded::text[] IS NULL
             OR NOT (queue = any(@queues_excluded))
@@ -536,6 +583,8 @@ updated_job AS (
         scheduled_at = coalesce(sqlc.narg('now')::timestamptz, now())
     FROM job_to_update
     WHERE river_job.id = job_to_update.id
+        -- Sequence retries require the group lock and an eligibility check.
+        AND river_job.sequence_key IS NULL
         -- Do not touch running jobs:
         AND river_job.state != 'running'
         -- If the job is already available with a prior scheduled_at, leave it alone.
@@ -748,3 +797,152 @@ SET
     state = CASE WHEN @state_do_update::boolean THEN @state::/* TEMPLATE: schema */river_job_state ELSE state END
 WHERE id = @id
 RETURNING *;
+
+-- name: SequenceGroupEnsure :exec
+INSERT INTO /* TEMPLATE: schema */river_sequence_group (key, next_check_at)
+VALUES (@key::text, now())
+ON CONFLICT (key) DO NOTHING;
+
+-- name: SequenceGroupGet :one
+SELECT * FROM /* TEMPLATE: schema */river_sequence_group WHERE key = @key::text;
+
+-- name: SequenceGroupLock :one
+SELECT * FROM /* TEMPLATE: schema */river_sequence_group WHERE key = @key::text FOR UPDATE;
+
+-- name: SequenceGroupLockSkip :one
+SELECT * FROM /* TEMPLATE: schema */river_sequence_group WHERE key = @key::text FOR UPDATE SKIP LOCKED;
+
+-- name: SequenceGroupList :many
+SELECT * FROM /* TEMPLATE: schema */river_sequence_group
+WHERE key > @after_key::text
+ORDER BY key
+LIMIT @max::bigint;
+
+-- name: SequenceGroupListDue :many
+SELECT * FROM /* TEMPLATE: schema */river_sequence_group
+WHERE key > @after_key::text
+    AND next_check_at IS NOT NULL
+    AND next_check_at <= @due_before::timestamptz
+ORDER BY key
+LIMIT @max::bigint;
+
+-- name: SequenceGroupUpdate :one
+UPDATE /* TEMPLATE: schema */river_sequence_group
+SET next_position = @next_position,
+    mode = @mode,
+    blocked_job_id = sqlc.narg('blocked_job_id'),
+    blocked_position = sqlc.narg('blocked_position'),
+    blocked_reason = sqlc.narg('blocked_reason'),
+    blocked_at = sqlc.narg('blocked_at')::timestamptz,
+    next_check_at = sqlc.narg('next_check_at')::timestamptz,
+    last_progress_at = @last_progress_at,
+    updated_at = now()
+WHERE key = @key::text
+RETURNING *;
+
+-- name: SequenceJobAttach :one
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_key = @key::text,
+    sequence_position = @position::bigint,
+    sequence_continue_on_cancelled = @continue_on_cancelled::boolean,
+    sequence_continue_on_discarded = @continue_on_discarded::boolean
+WHERE id = @id::bigint AND sequence_key IS NULL AND state = 'pending'
+RETURNING *;
+
+-- name: SequenceJobBypass :execrows
+WITH selected AS (
+    SELECT member.id FROM /* TEMPLATE: schema */river_job AS member
+    WHERE member.sequence_key = @key::text AND (member.sequence_resolved_at IS NULL OR member.state = 'pending')
+    ORDER BY member.sequence_position
+    LIMIT @max::bigint
+    FOR UPDATE NOWAIT
+)
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_resolved_at = coalesce(sequence_resolved_at, @now::timestamptz),
+    state = CASE WHEN state = 'pending' THEN
+        CASE WHEN scheduled_at <= statement_timestamp() THEN 'available'::/* TEMPLATE: schema */river_job_state ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state END
+        ELSE state END
+WHERE id IN (SELECT id FROM selected);
+
+-- name: SequenceJobGet :one
+SELECT * FROM /* TEMPLATE: schema */river_job
+WHERE id = @id::bigint AND sequence_key = @key::text
+FOR UPDATE NOWAIT;
+
+-- name: SequenceJobHeadLock :one
+SELECT * FROM /* TEMPLATE: schema */river_job
+WHERE sequence_key = @key::text AND sequence_resolved_at IS NULL
+ORDER BY sequence_position
+LIMIT 1
+FOR UPDATE NOWAIT;
+
+-- name: SequenceJobRelease :one
+UPDATE /* TEMPLATE: schema */river_job
+SET state = CASE WHEN scheduled_at <= statement_timestamp() THEN 'available'::/* TEMPLATE: schema */river_job_state ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state END
+WHERE id = @id::bigint AND sequence_key = @key::text
+    AND sequence_resolved_at IS NULL AND state = 'pending'
+RETURNING *;
+
+-- name: SequenceJobResolve :one
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_resolved_at = @now::timestamptz
+WHERE id = @id::bigint AND sequence_key = @key::text
+    AND sequence_resolved_at IS NULL AND state IN ('cancelled', 'completed', 'discarded')
+RETURNING *;
+
+-- name: SequenceJobRetry :one
+UPDATE /* TEMPLATE: schema */river_job
+SET state = CASE WHEN state = 'running' THEN state ELSE 'available'::/* TEMPLATE: schema */river_job_state END,
+    max_attempts = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce(sqlc.narg('now')::timestamptz, now())) THEN max_attempts
+        WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+    finalized_at = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce(sqlc.narg('now')::timestamptz, now())) THEN finalized_at ELSE NULL END,
+    scheduled_at = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce(sqlc.narg('now')::timestamptz, now())) THEN scheduled_at ELSE coalesce(sqlc.narg('now')::timestamptz, now()) END
+WHERE id = @id::bigint AND sequence_key = @key::text AND sequence_resolved_at IS NULL
+RETURNING *;
+
+-- name: SequenceJobStats :one
+WITH unresolved AS (
+    SELECT count(*)::bigint AS total,
+        count(*) FILTER (WHERE state = 'pending')::bigint AS pending
+    FROM /* TEMPLATE: schema */river_job
+    WHERE sequence_key = @key::text AND sequence_resolved_at IS NULL
+), active AS (
+    SELECT count(*)::bigint AS total,
+        count(*) FILTER (WHERE sequence_resolved_at IS NOT NULL)::bigint AS resolved
+    FROM /* TEMPLATE: schema */river_job
+    WHERE sequence_key = @key::text
+        AND (state IN ('available', 'running', 'retryable', 'scheduled')
+            OR (state = 'pending' AND sequence_resolved_at IS NOT NULL))
+)
+SELECT
+    coalesce((SELECT sequence_position FROM /* TEMPLATE: schema */river_job
+        WHERE sequence_key = @key::text ORDER BY sequence_position DESC LIMIT 1), 0)::bigint AS max_position,
+    unresolved.total::bigint AS unresolved,
+    (unresolved.pending + active.total)::bigint AS nonterminal,
+    active.resolved::bigint AS resolved_nonterminal,
+    active.total::bigint AS active
+FROM unresolved, active;
+
+-- name: SequenceOrphanList :many
+SELECT DISTINCT sequence_key::text AS key
+FROM /* TEMPLATE: schema */river_job AS job
+WHERE sequence_key > @after_key::text
+    AND sequence_resolved_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */river_sequence_group AS sequence_group WHERE sequence_group.key = job.sequence_key)
+ORDER BY key
+LIMIT @max::bigint;
+
+-- name: SequenceSetLocalTimeouts :exec
+SELECT set_config('lock_timeout', '100ms', true), set_config('statement_timeout', '1500ms', true);
+
+-- name: SequenceJobHead :one
+SELECT * FROM /* TEMPLATE: schema */river_job
+WHERE sequence_key = @key::text AND sequence_resolved_at IS NULL
+ORDER BY sequence_position
+LIMIT 1;
+
+-- name: SequenceSetReadCommitted :exec
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;

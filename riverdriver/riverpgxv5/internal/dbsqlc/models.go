@@ -61,24 +61,29 @@ func (ns NullRiverJobState) Value() (driver.Value, error) {
 }
 
 type RiverJob struct {
-	ID           int64
-	Args         []byte
-	Attempt      int16
-	AttemptedAt  *time.Time
-	AttemptedBy  []string
-	CreatedAt    time.Time
-	Errors       [][]byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int16
-	Metadata     []byte
-	Priority     int16
-	Queue        string
-	State        RiverJobState
-	ScheduledAt  time.Time
-	Tags         []string
-	UniqueKey    []byte
-	UniqueStates pgtype.Bits
+	ID                          int64
+	Args                        []byte
+	Attempt                     int16
+	AttemptedAt                 *time.Time
+	AttemptedBy                 []string
+	CreatedAt                   time.Time
+	Errors                      [][]byte
+	FinalizedAt                 *time.Time
+	Kind                        string
+	MaxAttempts                 int16
+	Metadata                    []byte
+	Priority                    int16
+	Queue                       string
+	State                       RiverJobState
+	ScheduledAt                 time.Time
+	Tags                        []string
+	SequenceKey                 *string
+	SequencePosition            *int64
+	SequenceContinueOnCancelled *bool
+	SequenceContinueOnDiscarded *bool
+	SequenceResolvedAt          *time.Time
+	UniqueKey                   []byte
+	UniqueStates                pgtype.Bits
 }
 
 type RiverLeader struct {
@@ -107,4 +112,18 @@ type RiverQueue struct {
 	Metadata  []byte
 	PausedAt  *time.Time
 	UpdatedAt time.Time
+}
+
+type RiverSequenceGroup struct {
+	Key             string
+	NextPosition    int64
+	Mode            string
+	BlockedJobID    *int64
+	BlockedPosition *int64
+	BlockedReason   *string
+	BlockedAt       *time.Time
+	NextCheckAt     *time.Time
+	LastProgressAt  time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }

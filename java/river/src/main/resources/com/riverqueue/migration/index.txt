@@ -6,3 +6,4 @@
 006_bulk_unique
 007_notification_outbox_sqlite_jsonb_and_sql_cleanup
 008_job_id_autoincrement
+009_sequences

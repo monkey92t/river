@@ -38,6 +38,8 @@ import (
 //go:embed migration/*/*.sql
 var migrationFS embed.FS
 
+var _ riverdriver.SequenceExecutor = (*Executor)(nil)
+
 // Driver is an implementation of riverdriver.Driver for Pgx v5.
 type Driver struct {
 	dbPool               *pgxpool.Pool
@@ -87,7 +89,11 @@ func (d *Driver) GetMigrationFS(line string) fs.FS {
 func (d *Driver) GetMigrationLines() []string { return []string{riverdriver.MigrationLineMain} }
 func (d *Driver) GetMigrationTruncateTables(line string, version int) []string {
 	if line == riverdriver.MigrationLineMain {
-		return riverdriver.MigrationLineMainTruncateTables(version)
+		tables := riverdriver.MigrationLineMainTruncateTables(version)
+		if version == 0 || version >= 9 {
+			tables = append(tables, "river_sequence_group")
+		}
+		return tables
 	}
 	panic("migration line does not exist: " + line)
 }
@@ -657,6 +663,9 @@ func (e *Executor) JobRetry(ctx context.Context, params *riverdriver.JobRetryPar
 	if err != nil {
 		return nil, interpretError(err)
 	}
+	if job.SequenceKey != nil {
+		return nil, riverdriver.ErrSequenceRetry
+	}
 	return jobRowFromInternal(job)
 }
 
@@ -1079,6 +1088,158 @@ func (e *Executor) SchemaGetExpired(ctx context.Context, params *riverdriver.Sch
 	return schemas, nil
 }
 
+// SequenceGroupEnsure registers a group without overwriting persistent policy.
+func (e *Executor) SequenceGroupEnsure(ctx context.Context, params *riverdriver.SequenceGroupKeyParams) error {
+	return interpretError(dbsqlc.New().SequenceGroupEnsure(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Key))
+}
+
+// SequenceGroupGet reads or locks one group within the caller's transaction.
+func (e *Executor) SequenceGroupGet(ctx context.Context, params *riverdriver.SequenceGroupGetParams) (*riverdriver.SequenceGroup, error) {
+	ctx = schemaTemplateParam(ctx, params.Schema)
+	var row *dbsqlc.RiverSequenceGroup
+	var err error
+	switch {
+	case params.Lock && params.SkipLocked:
+		row, err = dbsqlc.New().SequenceGroupLockSkip(ctx, e.dbtx, params.Key)
+	case params.Lock:
+		row, err = dbsqlc.New().SequenceGroupLock(ctx, e.dbtx, params.Key)
+	default:
+		row, err = dbsqlc.New().SequenceGroupGet(ctx, e.dbtx, params.Key)
+	}
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sequenceGroupFromInternal(row), nil
+}
+
+// SequenceGroupList pages groups without acquiring locks or loading job history.
+func (e *Executor) SequenceGroupList(ctx context.Context, params *riverdriver.SequenceGroupListParams) ([]*riverdriver.SequenceGroup, error) {
+	ctx = schemaTemplateParam(ctx, params.Schema)
+	var rows []*dbsqlc.RiverSequenceGroup
+	var err error
+	if params.DueBefore == nil {
+		rows, err = dbsqlc.New().SequenceGroupList(ctx, e.dbtx, &dbsqlc.SequenceGroupListParams{AfterKey: params.AfterKey, Max: int64(params.Limit)})
+	} else {
+		rows, err = dbsqlc.New().SequenceGroupListDue(ctx, e.dbtx, &dbsqlc.SequenceGroupListDueParams{AfterKey: params.AfterKey, DueBefore: *params.DueBefore, Max: int64(params.Limit)})
+	}
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	groups := make([]*riverdriver.SequenceGroup, len(rows))
+	for i, row := range rows {
+		groups[i] = sequenceGroupFromInternal(row)
+	}
+	return groups, nil
+}
+
+// SequenceGroupUpdate persists policy and allocation under the group lock.
+func (e *Executor) SequenceGroupUpdate(ctx context.Context, params *riverdriver.SequenceGroupUpdateParams) (*riverdriver.SequenceGroup, error) {
+	group := params.Group
+	row, err := dbsqlc.New().SequenceGroupUpdate(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceGroupUpdateParams{
+		Key: group.Key, NextPosition: group.NextPosition, Mode: group.Mode,
+		BlockedJobID: group.BlockedJobID, BlockedPosition: group.BlockedPosition,
+		BlockedReason: group.BlockedReason, BlockedAt: group.BlockedAt,
+		NextCheckAt: group.NextCheckAt, LastProgressAt: group.LastProgressAt,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return sequenceGroupFromInternal(row), nil
+}
+
+// SequenceJobAttach adds membership only to a newly inserted pending job.
+func (e *Executor) SequenceJobAttach(ctx context.Context, params *riverdriver.SequenceJobAttachParams) (*rivertype.JobRow, error) {
+	row, err := dbsqlc.New().SequenceJobAttach(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobAttachParams{
+		ID: params.ID, Key: params.Key, Position: params.Position,
+		ContinueOnCancelled: params.ContinueOnCancelled, ContinueOnDiscarded: params.ContinueOnDiscarded,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobBypass waives ordering without changing a member's task outcome.
+func (e *Executor) SequenceJobBypass(ctx context.Context, params *riverdriver.SequenceJobBypassParams) (int, error) {
+	count, err := dbsqlc.New().SequenceJobBypass(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobBypassParams{Key: params.Key, Max: int64(params.Limit), Now: params.Now})
+	return int(count), interpretError(err)
+}
+
+// SequenceJobGet locks an exact member without waiting behind its worker.
+func (e *Executor) SequenceJobGet(ctx context.Context, params *riverdriver.SequenceJobGetParams) (*rivertype.JobRow, error) {
+	row, err := dbsqlc.New().SequenceJobGet(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobGetParams{ID: params.ID, Key: params.Key})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobHead reads the earliest unresolved member, never skipping a locked head.
+func (e *Executor) SequenceJobHead(ctx context.Context, params *riverdriver.SequenceGroupKeyParams) (*rivertype.JobRow, error) {
+	ctx = schemaTemplateParam(ctx, params.Schema)
+	var row *dbsqlc.RiverJob
+	var err error
+	if params.Lock {
+		row, err = dbsqlc.New().SequenceJobHeadLock(ctx, e.dbtx, params.Key)
+	} else {
+		row, err = dbsqlc.New().SequenceJobHead(ctx, e.dbtx, params.Key)
+	}
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobRelease grants execution eligibility without altering the scheduled time.
+func (e *Executor) SequenceJobRelease(ctx context.Context, params *riverdriver.SequenceJobMutationParams) (*rivertype.JobRow, error) {
+	row, err := dbsqlc.New().SequenceJobRelease(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobReleaseParams{ID: params.ID, Key: params.Key})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobResolve retires only a terminal member after policy evaluation.
+func (e *Executor) SequenceJobResolve(ctx context.Context, params *riverdriver.SequenceJobMutationParams) (*rivertype.JobRow, error) {
+	row, err := dbsqlc.New().SequenceJobResolve(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobResolveParams{ID: params.ID, Key: params.Key, Now: params.Now})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobRetry retries the eligible member while preserving running work.
+func (e *Executor) SequenceJobRetry(ctx context.Context, params *riverdriver.SequenceJobRetryParams) (*rivertype.JobRow, error) {
+	row, err := dbsqlc.New().SequenceJobRetry(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceJobRetryParams{ID: params.ID, Key: params.Key, Now: params.Now})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowFromInternal(row)
+}
+
+// SequenceJobStats summarizes durable members, including already resolved active work.
+func (e *Executor) SequenceJobStats(ctx context.Context, params *riverdriver.SequenceGroupKeyParams) (*riverdriver.SequenceJobStats, error) {
+	row, err := dbsqlc.New().SequenceJobStats(schemaTemplateParam(ctx, params.Schema), e.dbtx, params.Key)
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return &riverdriver.SequenceJobStats{Active: row.Active, MaxPosition: row.MaxPosition, Nonterminal: row.Nonterminal, ResolvedNonterminal: row.ResolvedNonterminal, Unresolved: row.Unresolved}, nil
+}
+
+// SequenceOrphanList discovers members whose durable group record was removed.
+func (e *Executor) SequenceOrphanList(ctx context.Context, params *riverdriver.SequenceOrphanListParams) ([]string, error) {
+	keys, err := dbsqlc.New().SequenceOrphanList(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.SequenceOrphanListParams{AfterKey: params.AfterKey, Max: int64(params.Limit)})
+	return keys, interpretError(err)
+}
+
+// SequenceSetLocalTimeouts limits only the coordinator's short-lived transaction.
+func (e *Executor) SequenceSetLocalTimeouts(ctx context.Context) error {
+	if err := dbsqlc.New().SequenceSetReadCommitted(ctx, e.dbtx); err != nil {
+		return interpretError(err)
+	}
+	return interpretError(dbsqlc.New().SequenceSetLocalTimeouts(ctx, e.dbtx))
+}
+
 func (e *Executor) TableExists(ctx context.Context, params *riverdriver.TableExistsParams) (bool, error) {
 	// Different from other operations because the schemaAndTable name is a parameter.
 	schemaAndTable := params.Table
@@ -1394,24 +1555,29 @@ func jobRowFromInternalPartial(internal *dbsqlc.RiverJob) (*rivertype.JobRow, er
 	}
 
 	return &rivertype.JobRow{
-		ID:           internal.ID,
-		Attempt:      max(int(internal.Attempt), 0),
-		AttemptedAt:  attemptedAt,
-		AttemptedBy:  internal.AttemptedBy,
-		CreatedAt:    internal.CreatedAt.UTC(),
-		EncodedArgs:  internal.Args,
-		Errors:       errors,
-		FinalizedAt:  finalizedAt,
-		Kind:         internal.Kind,
-		MaxAttempts:  max(int(internal.MaxAttempts), 0),
-		Metadata:     internal.Metadata,
-		Priority:     max(int(internal.Priority), 0),
-		Queue:        internal.Queue,
-		ScheduledAt:  internal.ScheduledAt.UTC(),
-		State:        rivertype.JobState(internal.State),
-		Tags:         internal.Tags,
-		UniqueKey:    internal.UniqueKey,
-		UniqueStates: uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
+		ID:                          internal.ID,
+		Attempt:                     max(int(internal.Attempt), 0),
+		AttemptedAt:                 attemptedAt,
+		AttemptedBy:                 internal.AttemptedBy,
+		CreatedAt:                   internal.CreatedAt.UTC(),
+		EncodedArgs:                 internal.Args,
+		Errors:                      errors,
+		FinalizedAt:                 finalizedAt,
+		Kind:                        internal.Kind,
+		MaxAttempts:                 max(int(internal.MaxAttempts), 0),
+		Metadata:                    internal.Metadata,
+		Priority:                    max(int(internal.Priority), 0),
+		Queue:                       internal.Queue,
+		ScheduledAt:                 internal.ScheduledAt.UTC(),
+		SequenceKey:                 internal.SequenceKey,
+		SequencePosition:            internal.SequencePosition,
+		SequenceContinueOnCancelled: internal.SequenceContinueOnCancelled,
+		SequenceContinueOnDiscarded: internal.SequenceContinueOnDiscarded,
+		SequenceResolvedAt:          internal.SequenceResolvedAt,
+		State:                       rivertype.JobState(internal.State),
+		Tags:                        internal.Tags,
+		UniqueKey:                   internal.UniqueKey,
+		UniqueStates:                uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
 	}, decodeErr
 }
 
@@ -1478,4 +1644,14 @@ func schemaTemplateParam(ctx context.Context, schema string) context.Context {
 	return sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
 		"schema": {Value: schema, Stable: true},
 	}, nil)
+}
+
+// sequenceGroupFromInternal converts the generated model to shared driver state.
+func sequenceGroupFromInternal(row *dbsqlc.RiverSequenceGroup) *riverdriver.SequenceGroup {
+	return &riverdriver.SequenceGroup{
+		BlockedAt: row.BlockedAt, BlockedJobID: row.BlockedJobID, BlockedPosition: row.BlockedPosition,
+		BlockedReason: row.BlockedReason, CreatedAt: row.CreatedAt.UTC(), Key: row.Key,
+		LastProgressAt: row.LastProgressAt.UTC(), Mode: row.Mode, NextCheckAt: row.NextCheckAt,
+		NextPosition: row.NextPosition, UpdatedAt: row.UpdatedAt.UTC(),
+	}
 }

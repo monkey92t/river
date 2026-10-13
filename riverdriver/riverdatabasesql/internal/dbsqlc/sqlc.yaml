@@ -62,3 +62,32 @@ sql:
               type: "time.Time"
               pointer: true
             nullable: true
+
+          - column: "river_job.sequence_key"
+            go_type:
+              type: "string"
+              pointer: true
+          - column: "river_job.sequence_position"
+            go_type:
+              type: "int64"
+              pointer: true
+          - column: "river_job.sequence_continue_on_cancelled"
+            go_type:
+              type: "bool"
+              pointer: true
+          - column: "river_job.sequence_continue_on_discarded"
+            go_type:
+              type: "bool"
+              pointer: true
+          - column: "river_sequence_group.blocked_job_id"
+            go_type:
+              type: "int64"
+              pointer: true
+          - column: "river_sequence_group.blocked_position"
+            go_type:
+              type: "int64"
+              pointer: true
+          - column: "river_sequence_group.blocked_reason"
+            go_type:
+              type: "string"
+              pointer: true

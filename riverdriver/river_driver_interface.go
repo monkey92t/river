@@ -36,6 +36,9 @@ var (
 	ErrNotImplemented = errors.New("driver does not implement this functionality")
 )
 
+// ErrSequenceRetry requires retrying an ordered member through the sequence API.
+var ErrSequenceRetry = errors.New("river: sequence job requires sequence-aware retry")
+
 // Driver provides a database driver for use with river.Client.
 //
 // Its purpose is to wrap the interface of a third party database package, with
@@ -998,6 +1001,127 @@ type SchemaGetExpiredParams struct {
 	Prefix     string
 }
 
+// SequenceExecutor provides optional Postgres-only ordered job storage. Callers
+// must acquire the group lock before any job lock and use a single transaction.
+type SequenceExecutor interface {
+	SequenceGroupEnsure(ctx context.Context, params *SequenceGroupKeyParams) error
+	SequenceGroupGet(ctx context.Context, params *SequenceGroupGetParams) (*SequenceGroup, error)
+	SequenceGroupList(ctx context.Context, params *SequenceGroupListParams) ([]*SequenceGroup, error)
+	SequenceGroupUpdate(ctx context.Context, params *SequenceGroupUpdateParams) (*SequenceGroup, error)
+	SequenceJobAttach(ctx context.Context, params *SequenceJobAttachParams) (*rivertype.JobRow, error)
+	SequenceJobBypass(ctx context.Context, params *SequenceJobBypassParams) (int, error)
+	SequenceJobGet(ctx context.Context, params *SequenceJobGetParams) (*rivertype.JobRow, error)
+	SequenceJobHead(ctx context.Context, params *SequenceGroupKeyParams) (*rivertype.JobRow, error)
+	SequenceJobRelease(ctx context.Context, params *SequenceJobMutationParams) (*rivertype.JobRow, error)
+	SequenceJobResolve(ctx context.Context, params *SequenceJobMutationParams) (*rivertype.JobRow, error)
+	SequenceJobRetry(ctx context.Context, params *SequenceJobRetryParams) (*rivertype.JobRow, error)
+	SequenceJobStats(ctx context.Context, params *SequenceGroupKeyParams) (*SequenceJobStats, error)
+	SequenceOrphanList(ctx context.Context, params *SequenceOrphanListParams) ([]string, error)
+	SequenceSetLocalTimeouts(ctx context.Context) error
+}
+
+// SequenceGroup stores allocation and persistent stop policy for a sequence.
+type SequenceGroup struct {
+	BlockedAt       *time.Time
+	BlockedJobID    *int64
+	BlockedPosition *int64
+	BlockedReason   *string
+	CreatedAt       time.Time
+	Key             string
+	LastProgressAt  time.Time
+	Mode            string
+	NextCheckAt     *time.Time
+	NextPosition    int64
+	UpdatedAt       time.Time
+}
+
+// SequenceGroupGetParams selects a group, optionally locking its row.
+type SequenceGroupGetParams struct {
+	Key        string
+	Lock       bool
+	Schema     string
+	SkipLocked bool
+}
+
+// SequenceGroupKeyParams identifies one group within a schema.
+type SequenceGroupKeyParams struct {
+	Key    string
+	Lock   bool
+	Schema string
+}
+
+// SequenceGroupListParams pages groups by key, optionally restricting due time.
+type SequenceGroupListParams struct {
+	AfterKey  string
+	DueBefore *time.Time
+	Limit     int
+	Schema    string
+}
+
+// SequenceGroupUpdateParams replaces coordination fields while holding its lock.
+type SequenceGroupUpdateParams struct {
+	Group  *SequenceGroup
+	Schema string
+}
+
+// SequenceJobAttachParams attaches a newly inserted pending job to a locked group.
+type SequenceJobAttachParams struct {
+	ContinueOnCancelled bool
+	ContinueOnDiscarded bool
+	ID                  int64
+	Key                 string
+	Position            int64
+	Schema              string
+}
+
+// SequenceJobBypassParams releases a bounded batch and waives its ordering.
+type SequenceJobBypassParams struct {
+	Key    string
+	Limit  int
+	Now    time.Time
+	Schema string
+}
+
+// SequenceJobGetParams locks a particular member without waiting on its worker.
+type SequenceJobGetParams struct {
+	ID     int64
+	Key    string
+	Schema string
+}
+
+// SequenceJobMutationParams changes a locked member's coordination state.
+type SequenceJobMutationParams struct {
+	ID     int64
+	Key    string
+	Now    time.Time
+	Schema string
+}
+
+// SequenceJobRetryParams retries a locked member using the core retry clock.
+// Now defaults to the database transaction time when nil, as in JobRetryParams.
+type SequenceJobRetryParams struct {
+	ID     int64
+	Key    string
+	Now    *time.Time
+	Schema string
+}
+
+// SequenceJobStats summarizes members without replacing their authoritative rows.
+type SequenceJobStats struct {
+	Active              int64
+	MaxPosition         int64
+	Nonterminal         int64
+	ResolvedNonterminal int64
+	Unresolved          int64
+}
+
+// SequenceOrphanListParams pages unresolved members whose group row is missing.
+type SequenceOrphanListParams struct {
+	AfterKey string
+	Limit    int
+	Schema   string
+}
+
 type TableExistsParams struct {
 	Schema string
 	Table  string
@@ -1023,7 +1147,7 @@ func MigrationLineMainTruncateTables(version int) []string {
 		return []string{"river_job", "river_leader", "river_queue"}
 	case 5, 6:
 		return []string{"river_job", "river_leader", "river_queue", "river_client", "river_client_queue"}
-	case 0, 7, 8:
+	case 0, 7, 8, 9:
 		return []string{"river_job", "river_leader", "river_queue", "river_notification"}
 	}
 

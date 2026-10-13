@@ -1228,6 +1228,511 @@ func TestPeriodicJobEnqueuer(t *testing.T) {
 	})
 }
 
+// TestPeriodicJobIsolatedTransactions verifies that transaction isolation also
+// isolates execution latency from ordinary periodic scheduling.
+func TestPeriodicJobIsolatedTransactions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("BusyWorkerRetainsOneOccurrencePerHandle", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			blocked := make(chan struct{})
+			insertions := 0
+			svc, _ := newPeriodicIsolationTestEnqueuer(t, func(ctx context.Context, _ *periodicIsolationTx, _ []*rivertype.JobInsertParams) error {
+				insertions++
+				select {
+				case <-blocked:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			const numJobs = 40
+			constructions := make([]int, numJobs)
+			for i := range numJobs {
+				addPeriodicIsolationTestJob(t, svc, fmt.Sprintf("isolated_%d", i), "", time.Hour, true, func(*rivertype.JobInsertParams) { constructions[i]++ })
+			}
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			time.Sleep(3 * time.Second)
+			synctest.Wait()
+			require.Equal(t, 1, insertions, "only one isolated transaction may use a connection at a time")
+			for _, count := range constructions {
+				require.Equal(t, 1, count, "waiting occurrences must retain their original constructor result")
+			}
+			require.Positive(t, svc.timeUntilNextRun(), "a full worker must not leave an already due timer spinning")
+
+			close(blocked)
+			synctest.Wait()
+			for range numJobs {
+				if insertions == numJobs {
+					break
+				}
+				untilDispatch := svc.timeUntilNextRun()
+				require.Positive(t, untilDispatch)
+				require.Less(t, untilDispatch, time.Hour)
+				time.Sleep(untilDispatch)
+				synctest.Wait()
+			}
+			require.Equal(t, numJobs, insertions, "waiting occurrences must not be dropped when dispatch is full")
+			for _, count := range constructions {
+				require.Equal(t, 1, count)
+			}
+		})
+	})
+
+	t.Run("OrdinaryFutureTicksContinueWhileIsolatedInsertWaits", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			blocked := make(chan struct{})
+			ordinaryInserts, isolatedInserts := 0, 0
+			svc, exec := newPeriodicIsolationTestEnqueuer(t, func(ctx context.Context, _ *periodicIsolationTx, params []*rivertype.JobInsertParams) error {
+				if params[0].Kind == "ordinary" {
+					ordinaryInserts += len(params)
+					return nil
+				}
+				isolatedInserts++
+				select {
+				case <-blocked:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			addPeriodicIsolationTestJob(t, svc, "ordinary", "ordinary_schedule", time.Second, true, nil)
+			addPeriodicIsolationTestJob(t, svc, "isolated", "isolated_schedule", time.Hour, true, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+
+			require.Equal(t, 1, ordinaryInserts)
+			require.Equal(t, 1, isolatedInserts)
+			transactions := exec.snapshot()
+			require.Equal(t, []string{"ordinary"}, transactions[0].kinds)
+			require.True(t, transactions[0].committed)
+			require.NotContains(t, transactions[0].scheduleIDs, "isolated_schedule")
+
+			time.Sleep(3 * time.Second)
+			synctest.Wait()
+			require.Equal(t, 4, ordinaryInserts, "later ordinary ticks must run before the isolated transaction finishes")
+			require.Equal(t, 1, isolatedInserts)
+
+			close(blocked)
+			synctest.Wait()
+			for _, tx := range exec.snapshot() {
+				if len(tx.kinds) == 1 && tx.kinds[0] == "isolated" {
+					require.True(t, tx.committed)
+					require.Equal(t, []string{"isolated_schedule"}, tx.scheduleIDs, "the occurrence and durable schedule must commit together")
+				}
+			}
+		})
+	})
+
+	t.Run("PilotFailureRollsBackOccurrenceBeforeRetry", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			attempts := 0
+			svc, exec := newPeriodicIsolationTestEnqueuer(t, func(context.Context, *periodicIsolationTx, []*rivertype.JobInsertParams) error {
+				attempts++
+				return nil
+			})
+			pilot := svc.Config.Pilot.(*PilotPeriodicJobMock) //nolint:forcetypeassert
+			upsert := pilot.PeriodicJobUpsertManyMock
+			pilot.PeriodicJobUpsertManyMock = func(ctx context.Context, tx riverdriver.Executor, params *riverpilot.PeriodicJobUpsertManyParams) ([]*riverpilot.PeriodicJob, error) {
+				_, err := upsert(ctx, tx, params)
+				if attempts == 1 {
+					return nil, errors.New("schedule update failed")
+				}
+				return nil, err
+			}
+			addPeriodicIsolationTestJob(t, svc, "isolated", "durable_schedule", time.Hour, true, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			transactions := exec.occurrences()
+			require.Len(t, transactions, 1)
+			require.True(t, transactions[0].rolledBack)
+			require.False(t, transactions[0].committed)
+			require.Equal(t, []string{"durable_schedule"}, transactions[0].scheduleIDs)
+			time.Sleep(svc.timeUntilNextRun())
+			synctest.Wait()
+			transactions = exec.occurrences()
+			require.Len(t, transactions, 2)
+			require.True(t, transactions[1].committed)
+			require.Equal(t, []string{"durable_schedule"}, transactions[1].scheduleIDs)
+		})
+	})
+
+	t.Run("PreCommitFailureRetriesAfterConnectionCloses", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			attempts := 0
+			svc, exec := newPeriodicIsolationTestEnqueuer(t, func(_ context.Context, tx *periodicIsolationTx, _ []*rivertype.JobInsertParams) error {
+				attempts++
+				if attempts == 1 {
+					tx.rollbackErr = errors.New("connection closed")
+					return errors.New("insertion connection failed")
+				}
+				return nil
+			})
+			addPeriodicIsolationTestJob(t, svc, "isolated", "", time.Hour, true, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			require.Equal(t, 1, attempts)
+			untilRetry := svc.timeUntilNextRun()
+			require.Positive(t, untilRetry)
+			require.Less(t, untilRetry, time.Hour)
+			time.Sleep(untilRetry)
+			synctest.Wait()
+			require.Equal(t, 2, attempts, "an attempt that never sent COMMIT can retry after connection loss")
+			transactions := exec.occurrences()
+			require.False(t, transactions[0].committed)
+			require.True(t, transactions[1].committed)
+		})
+	})
+
+	t.Run("RemovedHandleCannotAdvanceReplacementWithSameID", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			blocked := make(chan struct{})
+			svc, _ := newPeriodicIsolationTestEnqueuer(t, func(_ context.Context, _ *periodicIsolationTx, params []*rivertype.JobInsertParams) error {
+				if params[0].Kind == "old" {
+					// Simulate an operation that has already reached the database
+					// and cannot finish immediately when its context is canceled.
+					<-blocked
+				}
+				return nil
+			})
+			oldHandle := addPeriodicIsolationTestJob(t, svc, "old", "replaceable", time.Second, true, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			svc.Remove(oldHandle)
+			newHandle := addPeriodicIsolationTestJob(t, svc, "replacement", "replaceable", time.Hour, false, nil)
+			synctest.Wait()
+			require.True(t, periodicIsolationNextRunAt(svc, newHandle).IsZero(), "the replacement must wait for the retired transaction to settle")
+			close(blocked)
+			synctest.Wait()
+			require.Equal(t, time.Now().Add(time.Hour), periodicIsolationNextRunAt(svc, newHandle))
+			require.NotEqual(t, oldHandle, newHandle)
+		})
+	})
+
+	t.Run("RestartReconcilesDurableProgressWithoutReplaying", func(t *testing.T) {
+		t.Parallel()
+
+		for _, advance := range []bool{true, false} {
+			name := "AdvancedScheduleSkipsOldOccurrence"
+			if !advance {
+				name = "EqualScheduleResumesOldOccurrence"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				synctest.Test(t, func(t *testing.T) {
+					attempts, constructions := 0, 0
+					svc, _ := newPeriodicIsolationTestEnqueuer(t, func(ctx context.Context, _ *periodicIsolationTx, _ []*rivertype.JobInsertParams) error {
+						attempts++
+						if attempts == 1 {
+							<-ctx.Done()
+							return ctx.Err()
+						}
+						return nil
+					})
+					var durableNextRunAt time.Time
+					pilot := svc.Config.Pilot.(*PilotPeriodicJobMock) //nolint:forcetypeassert
+					pilot.PeriodicJobGetAllMock = func(context.Context, riverdriver.Executor, *riverpilot.PeriodicJobGetAllParams) ([]*riverpilot.PeriodicJob, error) {
+						if durableNextRunAt.IsZero() {
+							return nil, nil
+						}
+						return []*riverpilot.PeriodicJob{{ID: "durable_restart", NextRunAt: durableNextRunAt}}, nil
+					}
+					handle := addPeriodicIsolationTestJob(t, svc, "isolated", "durable_restart", time.Hour, true, func(*rivertype.JobInsertParams) { constructions++ })
+					require.NoError(t, svc.Start(context.Background()))
+					synctest.Wait()
+					require.Equal(t, 1, attempts)
+					durableNextRunAt = periodicIsolationNextRunAt(svc, handle)
+					svc.Stop()
+					if advance {
+						// Another leader committed this occurrence and later ticks
+						// while this enqueuer was stopped.
+						durableNextRunAt = durableNextRunAt.Add(2 * time.Hour)
+					}
+					require.NoError(t, svc.Start(context.Background()))
+					defer svc.Stop()
+					synctest.Wait()
+					if advance {
+						require.Equal(t, 1, attempts, "a stale occurrence must not rewind durable progress")
+					} else {
+						if attempts == 1 {
+							untilRetry := svc.timeUntilNextRun()
+							require.Less(t, untilRetry, time.Hour)
+							time.Sleep(untilRetry)
+							synctest.Wait()
+						}
+						require.Equal(t, 2, attempts, "the initial RunOnStart schedule is not evidence that its occurrence committed")
+					}
+					require.Equal(t, 1, constructions)
+					require.Equal(t, durableNextRunAt, periodicIsolationNextRunAt(svc, handle))
+				})
+			})
+		}
+	})
+
+	t.Run("RollbackRetriesFreshParametersWithoutAdvancingSchedule", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			attempts, constructions := 0, 0
+			var observed []*rivertype.JobInsertParams
+			svc, exec := newPeriodicIsolationTestEnqueuer(t, func(_ context.Context, _ *periodicIsolationTx, params []*rivertype.JobInsertParams) error {
+				attempts++
+				job := params[0]
+				copyOfJob := *job
+				copyOfJob.Metadata = append([]byte(nil), job.Metadata...)
+				copyOfJob.EncodedArgs = append([]byte(nil), job.EncodedArgs...)
+				copyOfJob.Tags = append([]string(nil), job.Tags...)
+				copyOfJob.UniqueKey = append([]byte(nil), job.UniqueKey...)
+				copyOfJob.ScheduledAt = new(time.Time)
+				*copyOfJob.ScheduledAt = *job.ScheduledAt
+				observed = append(observed, &copyOfJob)
+				if attempts == 1 {
+					job.State = rivertype.JobStatePending
+					job.Metadata[0] = '!'
+					job.EncodedArgs[0] = '!'
+					job.Tags[0] = "mutated"
+					job.UniqueKey[0] = '!'
+					*job.ScheduledAt = job.ScheduledAt.Add(time.Hour)
+					return errors.New("transaction rolled back")
+				}
+				return nil
+			})
+			handle := addPeriodicIsolationTestJob(t, svc, "isolated", "retry_schedule", time.Hour, false, func(params *rivertype.JobInsertParams) {
+				constructions++
+				params.Tags = []string{"original"}
+				params.UniqueKey = []byte("original")
+			})
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			time.Sleep(time.Hour)
+			synctest.Wait()
+			require.Equal(t, 1, attempts)
+			require.Equal(t, 1, constructions)
+			initialNextRunAt := periodicIsolationNextRunAt(svc, handle)
+			untilRetry := svc.timeUntilNextRun()
+			require.Positive(t, untilRetry)
+			require.Less(t, untilRetry, time.Hour)
+			transactions := exec.occurrences()
+			require.False(t, transactions[0].committed)
+			require.True(t, transactions[0].rolledBack)
+			require.Empty(t, transactions[0].scheduleIDs)
+
+			time.Sleep(untilRetry)
+			synctest.Wait()
+			require.Equal(t, 2, attempts)
+			require.Equal(t, 1, constructions)
+			require.Equal(t, observed[0], observed[1], "an unsuccessful attempt must not mutate the pending occurrence")
+			require.Equal(t, initialNextRunAt.Add(time.Hour), periodicIsolationNextRunAt(svc, handle), "the schedule advances only after a successful commit")
+			transactions = exec.occurrences()
+			require.True(t, transactions[1].committed)
+			require.Equal(t, []string{"retry_schedule"}, transactions[1].scheduleIDs)
+		})
+	})
+
+	t.Run("ShutdownDrainsResultsBeforeJoiningWorker", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			svc, _ := newPeriodicIsolationTestEnqueuer(t, nil)
+			results := make(chan periodicJobIsolatedResult, 2)
+			workerDone := make(chan struct{})
+			for handle := range 2 {
+				results <- periodicJobIsolatedResult{occurrence: &periodicJobIsolatedOccurrence{handle: rivertype.PeriodicJobHandle(handle)}}
+			}
+			go func() {
+				// A final outcome must survive cancellation even when previous
+				// completions have filled the bounded result channel.
+				results <- periodicJobIsolatedResult{occurrence: &periodicJobIsolatedOccurrence{handle: 2}}
+				close(workerDone)
+			}()
+			synctest.Wait()
+			canceled := false
+			svc.finishIsolatedWorker(context.Background(), func() { canceled = true }, results, workerDone)
+			require.True(t, canceled)
+			require.Empty(t, results)
+			select {
+			case <-workerDone:
+			default:
+				t.Fatal("shutdown returned before the worker exited")
+			}
+		})
+	})
+
+	t.Run("StopCancelsWorkerAndRestartRetainsPendingOccurrence", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			attempts, constructions := 0, 0
+			svc, exec := newPeriodicIsolationTestEnqueuer(t, func(ctx context.Context, _ *periodicIsolationTx, _ []*rivertype.JobInsertParams) error {
+				attempts++
+				if attempts == 1 {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			})
+			addPeriodicIsolationTestJob(t, svc, "isolated", "", time.Hour, true, func(*rivertype.JobInsertParams) { constructions++ })
+			require.NoError(t, svc.Start(context.Background()))
+			synctest.Wait()
+			require.Equal(t, 1, attempts)
+			svc.Stop()
+			require.True(t, exec.snapshot()[0].rolledBack, "Stop must wait for worker transaction cleanup")
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			if attempts == 1 {
+				time.Sleep(svc.timeUntilNextRun())
+				synctest.Wait()
+			}
+			require.Equal(t, 2, attempts)
+			require.Equal(t, 1, constructions, "a canceled occurrence must not rerun its constructor on restart")
+			require.True(t, exec.snapshot()[1].committed)
+		})
+	})
+
+	t.Run("StopRetainsUnknownCommitReportedDuringShutdown", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			attempts := 0
+			svc, _ := newPeriodicIsolationTestEnqueuer(t, func(_ context.Context, tx *periodicIsolationTx, _ []*rivertype.JobInsertParams) error {
+				attempts++
+				tx.commit = func(ctx context.Context) error {
+					<-ctx.Done()
+					return errors.New("commit response lost during shutdown")
+				}
+				return nil
+			})
+			addPeriodicIsolationTestJob(t, svc, "isolated", "", time.Second, true, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			synctest.Wait()
+			require.Equal(t, 1, attempts)
+			svc.Stop()
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			time.Sleep(5 * time.Second)
+			synctest.Wait()
+			require.Equal(t, 1, attempts, "shutdown must retain a final unknown outcome instead of replaying it")
+		})
+	})
+
+	t.Run("UnknownCommitDoesNotReplayOrBlockOrdinaryTicks", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			isolatedAttempts, ordinaryInserts := 0, 0
+			svc, _ := newPeriodicIsolationTestEnqueuer(t, func(_ context.Context, tx *periodicIsolationTx, params []*rivertype.JobInsertParams) error {
+				if params[0].Kind == "ordinary" {
+					ordinaryInserts += len(params)
+				} else {
+					isolatedAttempts++
+					tx.commitErr = errors.New("connection lost during commit")
+				}
+				return nil
+			})
+			addPeriodicIsolationTestJob(t, svc, "isolated", "uncertain_schedule", time.Second, true, nil)
+			addPeriodicIsolationTestJob(t, svc, "ordinary", "", time.Second, false, nil)
+			require.NoError(t, svc.Start(context.Background()))
+			defer svc.Stop()
+			synctest.Wait()
+			time.Sleep(3 * time.Second)
+			synctest.Wait()
+			require.Equal(t, 1, isolatedAttempts)
+			require.Equal(t, 3, ordinaryInserts)
+			require.Positive(t, svc.timeUntilNextRun())
+			svc.Stop()
+			require.NoError(t, svc.Start(context.Background()))
+			synctest.Wait()
+			time.Sleep(2 * time.Second)
+			synctest.Wait()
+			require.Equal(t, 1, isolatedAttempts, "unknown outcomes must remain frozen across service restarts")
+		})
+	})
+}
+
+// newPeriodicIsolationTestEnqueuer creates a service with observable in-memory
+// transaction boundaries so virtual-time tests never depend on database clocks.
+func newPeriodicIsolationTestEnqueuer(t *testing.T, insert func(context.Context, *periodicIsolationTx, []*rivertype.JobInsertParams) error) (*PeriodicJobEnqueuer, *periodicIsolationExecutor) {
+	t.Helper()
+	exec := &periodicIsolationExecutor{}
+	pilot := NewPilotPeriodicJobMock()
+	pilot.PeriodicJobUpsertManyMock = func(_ context.Context, executor riverdriver.Executor, params *riverpilot.PeriodicJobUpsertManyParams) ([]*riverpilot.PeriodicJob, error) {
+		tx, ok := executor.(*periodicIsolationTx)
+		require.True(t, ok)
+		tx.mu.Lock()
+		defer tx.mu.Unlock()
+		for _, job := range params.Jobs {
+			tx.scheduleIDs = append(tx.scheduleIDs, job.ID)
+		}
+		return nil, nil
+	}
+	svc, err := NewPeriodicJobEnqueuer(riversharedtest.BaseServiceArchetype(t), &PeriodicJobEnqueuerConfig{
+		Insert: func(ctx context.Context, executor riverdriver.ExecutorTx, params []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
+			tx, ok := executor.(*periodicIsolationTx)
+			require.True(t, ok)
+			tx.mu.Lock()
+			for _, job := range params {
+				tx.kinds = append(tx.kinds, job.Kind)
+			}
+			tx.mu.Unlock()
+			return nil, insert(ctx, tx, params)
+		},
+		IsolateJob:            func(params *rivertype.JobInsertParams) bool { return params.Kind != "ordinary" },
+		IsolatedInsertTimeout: time.Minute,
+		Pilot:                 pilot,
+	}, exec)
+	require.NoError(t, err)
+	svc.StaggerStartupDisable(true)
+	return svc, exec
+}
+
+// addPeriodicIsolationTestJob registers a deterministic constructor and schedule.
+func addPeriodicIsolationTestJob(t *testing.T, svc *PeriodicJobEnqueuer, kind, id string, interval time.Duration, runOnStart bool, construct func(*rivertype.JobInsertParams)) rivertype.PeriodicJobHandle {
+	t.Helper()
+	handle, err := svc.AddSafely(&PeriodicJob{
+		ID: id,
+		ConstructorFunc: func() (*rivertype.JobInsertParams, error) {
+			params := &rivertype.JobInsertParams{
+				Kind: kind, State: rivertype.JobStateAvailable, EncodedArgs: []byte("{}"), Metadata: []byte("{}"),
+			}
+			if construct != nil {
+				construct(params)
+			}
+			return params, nil
+		},
+		RunOnStart:   runOnStart,
+		ScheduleFunc: func(now time.Time) time.Time { return now.Add(interval) },
+	})
+	require.NoError(t, err)
+	return handle
+}
+
+// periodicIsolationNextRunAt reads schedule state without racing its owner loop.
+func periodicIsolationNextRunAt(svc *PeriodicJobEnqueuer, handle rivertype.PeriodicJobHandle) time.Time {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+	return svc.periodicJobs[handle].nextRunAt
+}
+
 type PilotPeriodicJobMock struct {
 	PeriodicJobGetAllMock           func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobGetAllParams) ([]*riverpilot.PeriodicJob, error)
 	PeriodicJobKeepAliveAndReapMock func(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobKeepAliveAndReapParams) ([]*riverpilot.PeriodicJob, error)
@@ -1278,3 +1783,98 @@ var (
 	_ rivertype.Hook                  = HookPeriodicJobsStartFunc(func(ctx context.Context, params *rivertype.HookPeriodicJobsStartParams) error { return nil })
 	_ rivertype.HookPeriodicJobsStart = HookPeriodicJobsStartFunc(func(ctx context.Context, params *rivertype.HookPeriodicJobsStartParams) error { return nil })
 )
+
+// periodicIsolationExecutor observes transaction boundaries without database state.
+type periodicIsolationExecutor struct {
+	riverdriver.Executor
+
+	mu           sync.Mutex
+	transactions []*periodicIsolationTx
+}
+
+// Begin records a new independent transaction.
+func (exec *periodicIsolationExecutor) Begin(context.Context) (riverdriver.ExecutorTx, error) {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	tx := &periodicIsolationTx{}
+	exec.transactions = append(exec.transactions, tx)
+	return tx, nil
+}
+
+// snapshot returns immutable transaction records for assertions after a worker yields.
+func (exec *periodicIsolationExecutor) snapshot() []periodicIsolationTxRecord {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	records := make([]periodicIsolationTxRecord, len(exec.transactions))
+	for i, tx := range exec.transactions {
+		tx.mu.Lock()
+		records[i] = periodicIsolationTxRecord{
+			committed: tx.committed, rolledBack: tx.rolledBack,
+			kinds: append([]string(nil), tx.kinds...), scheduleIDs: append([]string(nil), tx.scheduleIDs...),
+		}
+		tx.mu.Unlock()
+	}
+	return records
+}
+
+// occurrences excludes registration-only transactions from insertion assertions.
+func (exec *periodicIsolationExecutor) occurrences() []periodicIsolationTxRecord {
+	var occurrences []periodicIsolationTxRecord
+	for _, tx := range exec.snapshot() {
+		if len(tx.kinds) > 0 {
+			occurrences = append(occurrences, tx)
+		}
+	}
+	return occurrences
+}
+
+// periodicIsolationTxRecord captures the operations performed by one transaction.
+type periodicIsolationTxRecord struct {
+	committed   bool
+	rolledBack  bool
+	kinds       []string
+	scheduleIDs []string
+}
+
+// periodicIsolationTx records which occurrences and schedule updates commit together.
+type periodicIsolationTx struct {
+	riverdriver.ExecutorTx
+
+	mu          sync.Mutex
+	committed   bool
+	commitErr   error
+	commit      func(context.Context) error
+	kinds       []string
+	rolledBack  bool
+	rollbackErr error
+	scheduleIDs []string
+}
+
+// Commit preserves the recorded occurrence and schedule update bundle.
+func (tx *periodicIsolationTx) Commit(ctx context.Context) error {
+	if tx.commit != nil {
+		if err := tx.commit(ctx); err != nil {
+			return err
+		}
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.commitErr != nil {
+		return tx.commitErr
+	}
+	tx.committed = true
+	return nil
+}
+
+// Rollback records only uncommitted transaction cleanup.
+func (tx *periodicIsolationTx) Rollback(context.Context) error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.rollbackErr != nil {
+		return tx.rollbackErr
+	}
+	if !tx.committed {
+		tx.rolledBack = true
+	}
+	return nil
+}

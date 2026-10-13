@@ -120,6 +120,24 @@ type JobRow struct {
 	// additional retry attempts remaining.
 	ScheduledAt time.Time
 
+	// SequenceContinueOnCancelled controls progression after this member is cancelled.
+	// It is nil for jobs that do not belong to a sequence.
+	SequenceContinueOnCancelled *bool `json:"sequence_continue_on_cancelled,omitempty"`
+
+	// SequenceContinueOnDiscarded controls progression after this member exhausts retries.
+	// It is nil for jobs that do not belong to a sequence.
+	SequenceContinueOnDiscarded *bool `json:"sequence_continue_on_discarded,omitempty"`
+
+	// SequenceKey identifies the durable sequence group; nil means an ordinary job.
+	SequenceKey *string `json:"sequence_key,omitempty"`
+
+	// SequencePosition is the immutable position allocated within the group.
+	SequencePosition *int64 `json:"sequence_position,omitempty"`
+
+	// SequenceResolvedAt records that the ordering obligation has been retired.
+	// Emergency bypass may resolve an unfinished job without changing its outcome.
+	SequenceResolvedAt *time.Time `json:"sequence_resolved_at,omitempty"`
+
 	// State is the state of job like `available` or `completed`. Jobs are
 	// `available` when they're first inserted.
 	State JobState

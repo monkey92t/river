@@ -46,17 +46,17 @@ updated_job AS (
         metadata = jsonb_set(metadata, '{cancel_attempted_at}'::text[], $6::jsonb, true)
     FROM notification
     WHERE river_job.id = notification.id
-    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 )
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states FROM (
-    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states FROM (
+    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
     FROM /* TEMPLATE: schema */river_job
     WHERE id = $1::bigint
     FOR UPDATE
 ) AS fallback_job
 WHERE fallback_job.id NOT IN (SELECT id FROM updated_job)
 UNION
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM updated_job
 `
 
@@ -96,6 +96,11 @@ func (q *Queries) JobCancel(ctx context.Context, db DBTX, arg *JobCancelParams) 
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -225,14 +230,14 @@ deleted_job AS (
     WHERE river_job.id = job_to_delete.id
         -- Do not touch running jobs:
         AND river_job.state != 'running'
-    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 )
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE id = $1::bigint
     AND id NOT IN (SELECT id FROM deleted_job)
 UNION
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM deleted_job
 `
 
@@ -256,6 +261,11 @@ func (q *Queries) JobDelete(ctx context.Context, db DBTX, id int64) (*RiverJob, 
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -272,6 +282,7 @@ WHERE id IN (
             (state = 'completed' AND $3 AND finalized_at < $4::timestamptz) OR
             (state = 'discarded' AND $5 AND finalized_at < $6::timestamptz)
         )
+        AND (sequence_key IS NULL OR sequence_resolved_at IS NOT NULL)
         AND (
             $7::text[] IS NULL
             OR NOT (queue = any($7))
@@ -313,7 +324,7 @@ func (q *Queries) JobDeleteBefore(ctx context.Context, db DBTX, arg *JobDeleteBe
 
 const jobDeleteMany = `-- name: JobDeleteMany :many
 WITH jobs_to_delete AS (
-    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
     FROM /* TEMPLATE: schema */river_job
     WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
         AND state != 'running'
@@ -325,9 +336,9 @@ WITH jobs_to_delete AS (
 deleted_jobs AS (
     DELETE FROM /* TEMPLATE: schema */river_job
     WHERE id IN (SELECT id FROM jobs_to_delete)
-    RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+    RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 )
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE id IN (SELECT id FROM deleted_jobs)
 ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
@@ -361,6 +372,11 @@ func (q *Queries) JobDeleteMany(ctx context.Context, db DBTX, max int32) ([]*Riv
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -377,7 +393,7 @@ func (q *Queries) JobDeleteMany(ctx context.Context, db DBTX, max int32) ([]*Riv
 const jobGetAvailable = `-- name: JobGetAvailable :many
 WITH locked_jobs AS (
     SELECT
-        id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+        id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
     FROM
         /* TEMPLATE: schema */river_job
     WHERE
@@ -412,7 +428,7 @@ FROM
 WHERE
     river_job.id = locked_jobs.id
 RETURNING
-    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 `
 
 type JobGetAvailableParams struct {
@@ -457,6 +473,11 @@ func (q *Queries) JobGetAvailable(ctx context.Context, db DBTX, arg *JobGetAvail
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -471,7 +492,7 @@ func (q *Queries) JobGetAvailable(ctx context.Context, db DBTX, arg *JobGetAvail
 }
 
 const jobGetByID = `-- name: JobGetByID :one
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE id = $1
 LIMIT 1
@@ -497,6 +518,11 @@ func (q *Queries) JobGetByID(ctx context.Context, db DBTX, id int64) (*RiverJob,
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -504,7 +530,7 @@ func (q *Queries) JobGetByID(ctx context.Context, db DBTX, id int64) (*RiverJob,
 }
 
 const jobGetByIDMany = `-- name: JobGetByIDMany :many
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE id = any($1::bigint[])
 ORDER BY id
@@ -536,6 +562,11 @@ func (q *Queries) JobGetByIDMany(ctx context.Context, db DBTX, id []int64) ([]*R
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -550,7 +581,7 @@ func (q *Queries) JobGetByIDMany(ctx context.Context, db DBTX, id []int64) ([]*R
 }
 
 const jobGetByKindMany = `-- name: JobGetByKindMany :many
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE kind = any($1::text[])
 ORDER BY id
@@ -582,6 +613,11 @@ func (q *Queries) JobGetByKindMany(ctx context.Context, db DBTX, kind []string) 
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -625,7 +661,7 @@ func (q *Queries) JobGetCancelRequested(ctx context.Context, db DBTX, id []int64
 }
 
 const jobGetStuck = `-- name: JobGetStuck :many
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE state = 'running'
     AND id > $1::bigint
@@ -666,6 +702,11 @@ func (q *Queries) JobGetStuck(ctx context.Context, db DBTX, arg *JobGetStuckPara
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -736,7 +777,7 @@ ON CONFLICT (unique_key)
     -- Keep the existing kind, which may differ under ` + "`" + `ExcludeKind` + "`" + `.
     DO UPDATE SET kind = river_job.kind
 RETURNING
-    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states,
+    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states,
     /* TEMPLATE_BEGIN: unique_skipped_as_duplicate */ (xmax != 0) /* TEMPLATE_END */ AS unique_skipped_as_duplicate
 `
 
@@ -801,6 +842,11 @@ func (q *Queries) JobInsertFastMany(ctx context.Context, db DBTX, arg *JobInsert
 			&i.RiverJob.State,
 			&i.RiverJob.ScheduledAt,
 			&i.RiverJob.Tags,
+			&i.RiverJob.SequenceKey,
+			&i.RiverJob.SequencePosition,
+			&i.RiverJob.SequenceContinueOnCancelled,
+			&i.RiverJob.SequenceContinueOnDiscarded,
+			&i.RiverJob.SequenceResolvedAt,
 			&i.RiverJob.UniqueKey,
 			&i.RiverJob.UniqueStates,
 			&i.UniqueSkippedAsDuplicate,
@@ -931,7 +977,7 @@ INSERT INTO /* TEMPLATE: schema */river_job(
     -- to Postgres binary like ` + "`" + `\xAAAA` + "`" + `.
     nullif($16::text, '')::bytea,
     nullif($17::integer, 0)::bit(8)
-) RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+) RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 `
 
 type JobInsertFullParams struct {
@@ -992,6 +1038,11 @@ func (q *Queries) JobInsertFull(ctx context.Context, db DBTX, arg *JobInsertFull
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -1054,7 +1105,7 @@ SELECT
     nullif(unique_key, '')::bytea,
     nullif(unique_states::integer, 0)::bit(8)
 FROM raw_job_data
-RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 `
 
 type JobInsertFullManyParams struct {
@@ -1117,6 +1168,11 @@ func (q *Queries) JobInsertFullMany(ctx context.Context, db DBTX, arg *JobInsert
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -1173,7 +1229,7 @@ func (q *Queries) JobKindList(ctx context.Context, db DBTX, arg *JobKindListPara
 }
 
 const jobList = `-- name: JobList :many
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM /* TEMPLATE: schema */river_job
 WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
@@ -1206,6 +1262,11 @@ func (q *Queries) JobList(ctx context.Context, db DBTX, max int32) ([]*RiverJob,
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -1287,6 +1348,8 @@ updated_job AS (
         scheduled_at = coalesce($2::timestamptz, now())
     FROM job_to_update
     WHERE river_job.id = job_to_update.id
+        -- Sequence retries require the group lock and an eligibility check.
+        AND river_job.sequence_key IS NULL
         -- Do not touch running jobs:
         AND river_job.state != 'running'
         -- If the job is already available with a prior scheduled_at, leave it alone.
@@ -1294,17 +1357,17 @@ updated_job AS (
             river_job.state = 'available'
             AND river_job.scheduled_at < coalesce($2::timestamptz, now())
         )
-    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 )
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states FROM (
-    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states FROM (
+    SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
     FROM /* TEMPLATE: schema */river_job
     WHERE id = $1::bigint
     FOR UPDATE
 ) AS fallback_job
 WHERE fallback_job.id NOT IN (SELECT id FROM updated_job)
 UNION
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM updated_job
 `
 
@@ -1333,6 +1396,11 @@ func (q *Queries) JobRetry(ctx context.Context, db DBTX, arg *JobRetryParams) (*
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -1415,7 +1483,7 @@ updated_jobs AS (
         job_updates.new_state = 'discarded'::/* TEMPLATE: schema */river_job_state AS conflict_discarded
 )
 SELECT
-    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states,
+    river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states,
     updated_jobs.conflict_discarded
 FROM /* TEMPLATE: schema */river_job
 JOIN updated_jobs ON river_job.id = updated_jobs.id
@@ -1457,6 +1525,11 @@ func (q *Queries) JobSchedule(ctx context.Context, db DBTX, arg *JobSchedulePara
 			&i.RiverJob.State,
 			&i.RiverJob.ScheduledAt,
 			&i.RiverJob.Tags,
+			&i.RiverJob.SequenceKey,
+			&i.RiverJob.SequencePosition,
+			&i.RiverJob.SequenceContinueOnCancelled,
+			&i.RiverJob.SequenceContinueOnDiscarded,
+			&i.RiverJob.SequenceResolvedAt,
 			&i.RiverJob.UniqueKey,
 			&i.RiverJob.UniqueStates,
 			&i.ConflictDiscarded,
@@ -1537,9 +1610,9 @@ updated AS (
     FROM job_input
     WHERE river_job.id = job_input.id
       AND (river_job.state = 'running' OR job_input.metadata_do_merge)
-    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+    RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 )
-SELECT river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+SELECT river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 FROM /* TEMPLATE: schema */river_job
 JOIN job_input ON river_job.id = job_input.id
 WHERE NOT EXISTS (
@@ -1548,7 +1621,7 @@ WHERE NOT EXISTS (
     WHERE updated.id = river_job.id
 )
 UNION ALL
-SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM updated
 ORDER BY id
 `
@@ -1609,6 +1682,11 @@ func (q *Queries) JobSetStateIfRunningMany(ctx context.Context, db DBTX, arg *Jo
 			&i.State,
 			&i.ScheduledAt,
 			&i.Tags,
+			&i.SequenceKey,
+			&i.SequencePosition,
+			&i.SequenceContinueOnCancelled,
+			&i.SequenceContinueOnDiscarded,
+			&i.SequenceResolvedAt,
 			&i.UniqueKey,
 			&i.UniqueStates,
 		); err != nil {
@@ -1635,7 +1713,7 @@ SET
 FROM
     locked_job
 WHERE river_job.id = locked_job.id
-RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.unique_key, river_job.unique_states
+RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 `
 
 type JobUpdateParams struct {
@@ -1664,6 +1742,11 @@ func (q *Queries) JobUpdate(ctx context.Context, db DBTX, arg *JobUpdateParams) 
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
@@ -1682,7 +1765,7 @@ SET
     metadata = CASE WHEN $13::boolean THEN $14::jsonb ELSE metadata END,
     state = CASE WHEN $15::boolean THEN $16::/* TEMPLATE: schema */river_job_state ELSE state END
 WHERE id = $17
-RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 `
 
 type JobUpdateFullParams struct {
@@ -1745,8 +1828,682 @@ func (q *Queries) JobUpdateFull(ctx context.Context, db DBTX, arg *JobUpdateFull
 		&i.State,
 		&i.ScheduledAt,
 		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
 		&i.UniqueKey,
 		&i.UniqueStates,
 	)
 	return &i, err
+}
+
+const sequenceGroupEnsure = `-- name: SequenceGroupEnsure :exec
+INSERT INTO /* TEMPLATE: schema */river_sequence_group (key, next_check_at)
+VALUES ($1::text, now())
+ON CONFLICT (key) DO NOTHING
+`
+
+func (q *Queries) SequenceGroupEnsure(ctx context.Context, db DBTX, key string) error {
+	_, err := db.Exec(ctx, sequenceGroupEnsure, key)
+	return err
+}
+
+const sequenceGroupGet = `-- name: SequenceGroupGet :one
+SELECT key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at FROM /* TEMPLATE: schema */river_sequence_group WHERE key = $1::text
+`
+
+func (q *Queries) SequenceGroupGet(ctx context.Context, db DBTX, key string) (*RiverSequenceGroup, error) {
+	row := db.QueryRow(ctx, sequenceGroupGet, key)
+	var i RiverSequenceGroup
+	err := row.Scan(
+		&i.Key,
+		&i.NextPosition,
+		&i.Mode,
+		&i.BlockedJobID,
+		&i.BlockedPosition,
+		&i.BlockedReason,
+		&i.BlockedAt,
+		&i.NextCheckAt,
+		&i.LastProgressAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
+const sequenceGroupList = `-- name: SequenceGroupList :many
+SELECT key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at FROM /* TEMPLATE: schema */river_sequence_group
+WHERE key > $1::text
+ORDER BY key
+LIMIT $2::bigint
+`
+
+type SequenceGroupListParams struct {
+	AfterKey string
+	Max      int64
+}
+
+func (q *Queries) SequenceGroupList(ctx context.Context, db DBTX, arg *SequenceGroupListParams) ([]*RiverSequenceGroup, error) {
+	rows, err := db.Query(ctx, sequenceGroupList, arg.AfterKey, arg.Max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*RiverSequenceGroup
+	for rows.Next() {
+		var i RiverSequenceGroup
+		if err := rows.Scan(
+			&i.Key,
+			&i.NextPosition,
+			&i.Mode,
+			&i.BlockedJobID,
+			&i.BlockedPosition,
+			&i.BlockedReason,
+			&i.BlockedAt,
+			&i.NextCheckAt,
+			&i.LastProgressAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sequenceGroupListDue = `-- name: SequenceGroupListDue :many
+SELECT key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at FROM /* TEMPLATE: schema */river_sequence_group
+WHERE key > $1::text
+    AND next_check_at IS NOT NULL
+    AND next_check_at <= $2::timestamptz
+ORDER BY key
+LIMIT $3::bigint
+`
+
+type SequenceGroupListDueParams struct {
+	AfterKey  string
+	DueBefore time.Time
+	Max       int64
+}
+
+func (q *Queries) SequenceGroupListDue(ctx context.Context, db DBTX, arg *SequenceGroupListDueParams) ([]*RiverSequenceGroup, error) {
+	rows, err := db.Query(ctx, sequenceGroupListDue, arg.AfterKey, arg.DueBefore, arg.Max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*RiverSequenceGroup
+	for rows.Next() {
+		var i RiverSequenceGroup
+		if err := rows.Scan(
+			&i.Key,
+			&i.NextPosition,
+			&i.Mode,
+			&i.BlockedJobID,
+			&i.BlockedPosition,
+			&i.BlockedReason,
+			&i.BlockedAt,
+			&i.NextCheckAt,
+			&i.LastProgressAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sequenceGroupLock = `-- name: SequenceGroupLock :one
+SELECT key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at FROM /* TEMPLATE: schema */river_sequence_group WHERE key = $1::text FOR UPDATE
+`
+
+func (q *Queries) SequenceGroupLock(ctx context.Context, db DBTX, key string) (*RiverSequenceGroup, error) {
+	row := db.QueryRow(ctx, sequenceGroupLock, key)
+	var i RiverSequenceGroup
+	err := row.Scan(
+		&i.Key,
+		&i.NextPosition,
+		&i.Mode,
+		&i.BlockedJobID,
+		&i.BlockedPosition,
+		&i.BlockedReason,
+		&i.BlockedAt,
+		&i.NextCheckAt,
+		&i.LastProgressAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
+const sequenceGroupLockSkip = `-- name: SequenceGroupLockSkip :one
+SELECT key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at FROM /* TEMPLATE: schema */river_sequence_group WHERE key = $1::text FOR UPDATE SKIP LOCKED
+`
+
+func (q *Queries) SequenceGroupLockSkip(ctx context.Context, db DBTX, key string) (*RiverSequenceGroup, error) {
+	row := db.QueryRow(ctx, sequenceGroupLockSkip, key)
+	var i RiverSequenceGroup
+	err := row.Scan(
+		&i.Key,
+		&i.NextPosition,
+		&i.Mode,
+		&i.BlockedJobID,
+		&i.BlockedPosition,
+		&i.BlockedReason,
+		&i.BlockedAt,
+		&i.NextCheckAt,
+		&i.LastProgressAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
+const sequenceGroupUpdate = `-- name: SequenceGroupUpdate :one
+UPDATE /* TEMPLATE: schema */river_sequence_group
+SET next_position = $1,
+    mode = $2,
+    blocked_job_id = $3,
+    blocked_position = $4,
+    blocked_reason = $5,
+    blocked_at = $6::timestamptz,
+    next_check_at = $7::timestamptz,
+    last_progress_at = $8,
+    updated_at = now()
+WHERE key = $9::text
+RETURNING key, next_position, mode, blocked_job_id, blocked_position, blocked_reason, blocked_at, next_check_at, last_progress_at, created_at, updated_at
+`
+
+type SequenceGroupUpdateParams struct {
+	NextPosition    int64
+	Mode            string
+	BlockedJobID    *int64
+	BlockedPosition *int64
+	BlockedReason   *string
+	BlockedAt       *time.Time
+	NextCheckAt     *time.Time
+	LastProgressAt  time.Time
+	Key             string
+}
+
+func (q *Queries) SequenceGroupUpdate(ctx context.Context, db DBTX, arg *SequenceGroupUpdateParams) (*RiverSequenceGroup, error) {
+	row := db.QueryRow(ctx, sequenceGroupUpdate,
+		arg.NextPosition,
+		arg.Mode,
+		arg.BlockedJobID,
+		arg.BlockedPosition,
+		arg.BlockedReason,
+		arg.BlockedAt,
+		arg.NextCheckAt,
+		arg.LastProgressAt,
+		arg.Key,
+	)
+	var i RiverSequenceGroup
+	err := row.Scan(
+		&i.Key,
+		&i.NextPosition,
+		&i.Mode,
+		&i.BlockedJobID,
+		&i.BlockedPosition,
+		&i.BlockedReason,
+		&i.BlockedAt,
+		&i.NextCheckAt,
+		&i.LastProgressAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
+const sequenceJobAttach = `-- name: SequenceJobAttach :one
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_key = $1::text,
+    sequence_position = $2::bigint,
+    sequence_continue_on_cancelled = $3::boolean,
+    sequence_continue_on_discarded = $4::boolean
+WHERE id = $5::bigint AND sequence_key IS NULL AND state = 'pending'
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
+`
+
+type SequenceJobAttachParams struct {
+	Key                 string
+	Position            int64
+	ContinueOnCancelled bool
+	ContinueOnDiscarded bool
+	ID                  int64
+}
+
+func (q *Queries) SequenceJobAttach(ctx context.Context, db DBTX, arg *SequenceJobAttachParams) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobAttach,
+		arg.Key,
+		arg.Position,
+		arg.ContinueOnCancelled,
+		arg.ContinueOnDiscarded,
+		arg.ID,
+	)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobBypass = `-- name: SequenceJobBypass :execrows
+WITH selected AS (
+    SELECT member.id FROM /* TEMPLATE: schema */river_job AS member
+    WHERE member.sequence_key = $2::text AND (member.sequence_resolved_at IS NULL OR member.state = 'pending')
+    ORDER BY member.sequence_position
+    LIMIT $3::bigint
+    FOR UPDATE NOWAIT
+)
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_resolved_at = coalesce(sequence_resolved_at, $1::timestamptz),
+    state = CASE WHEN state = 'pending' THEN
+        CASE WHEN scheduled_at <= statement_timestamp() THEN 'available'::/* TEMPLATE: schema */river_job_state ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state END
+        ELSE state END
+WHERE id IN (SELECT id FROM selected)
+`
+
+type SequenceJobBypassParams struct {
+	Now time.Time
+	Key string
+	Max int64
+}
+
+func (q *Queries) SequenceJobBypass(ctx context.Context, db DBTX, arg *SequenceJobBypassParams) (int64, error) {
+	result, err := db.Exec(ctx, sequenceJobBypass, arg.Now, arg.Key, arg.Max)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const sequenceJobGet = `-- name: SequenceJobGet :one
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states FROM /* TEMPLATE: schema */river_job
+WHERE id = $1::bigint AND sequence_key = $2::text
+FOR UPDATE NOWAIT
+`
+
+type SequenceJobGetParams struct {
+	ID  int64
+	Key string
+}
+
+func (q *Queries) SequenceJobGet(ctx context.Context, db DBTX, arg *SequenceJobGetParams) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobGet, arg.ID, arg.Key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobHead = `-- name: SequenceJobHead :one
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states FROM /* TEMPLATE: schema */river_job
+WHERE sequence_key = $1::text AND sequence_resolved_at IS NULL
+ORDER BY sequence_position
+LIMIT 1
+`
+
+func (q *Queries) SequenceJobHead(ctx context.Context, db DBTX, key string) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobHead, key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobHeadLock = `-- name: SequenceJobHeadLock :one
+SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states FROM /* TEMPLATE: schema */river_job
+WHERE sequence_key = $1::text AND sequence_resolved_at IS NULL
+ORDER BY sequence_position
+LIMIT 1
+FOR UPDATE NOWAIT
+`
+
+func (q *Queries) SequenceJobHeadLock(ctx context.Context, db DBTX, key string) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobHeadLock, key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobRelease = `-- name: SequenceJobRelease :one
+UPDATE /* TEMPLATE: schema */river_job
+SET state = CASE WHEN scheduled_at <= statement_timestamp() THEN 'available'::/* TEMPLATE: schema */river_job_state ELSE 'scheduled'::/* TEMPLATE: schema */river_job_state END
+WHERE id = $1::bigint AND sequence_key = $2::text
+    AND sequence_resolved_at IS NULL AND state = 'pending'
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
+`
+
+type SequenceJobReleaseParams struct {
+	ID  int64
+	Key string
+}
+
+func (q *Queries) SequenceJobRelease(ctx context.Context, db DBTX, arg *SequenceJobReleaseParams) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobRelease, arg.ID, arg.Key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobResolve = `-- name: SequenceJobResolve :one
+UPDATE /* TEMPLATE: schema */river_job
+SET sequence_resolved_at = $1::timestamptz
+WHERE id = $2::bigint AND sequence_key = $3::text
+    AND sequence_resolved_at IS NULL AND state IN ('cancelled', 'completed', 'discarded')
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
+`
+
+type SequenceJobResolveParams struct {
+	Now time.Time
+	ID  int64
+	Key string
+}
+
+func (q *Queries) SequenceJobResolve(ctx context.Context, db DBTX, arg *SequenceJobResolveParams) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobResolve, arg.Now, arg.ID, arg.Key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobRetry = `-- name: SequenceJobRetry :one
+UPDATE /* TEMPLATE: schema */river_job
+SET state = CASE WHEN state = 'running' THEN state ELSE 'available'::/* TEMPLATE: schema */river_job_state END,
+    max_attempts = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce($1::timestamptz, now())) THEN max_attempts
+        WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+    finalized_at = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce($1::timestamptz, now())) THEN finalized_at ELSE NULL END,
+    scheduled_at = CASE
+        WHEN state = 'running' OR (state = 'available' AND scheduled_at < coalesce($1::timestamptz, now())) THEN scheduled_at ELSE coalesce($1::timestamptz, now()) END
+WHERE id = $2::bigint AND sequence_key = $3::text AND sequence_resolved_at IS NULL
+RETURNING id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
+`
+
+type SequenceJobRetryParams struct {
+	Now *time.Time
+	ID  int64
+	Key string
+}
+
+func (q *Queries) SequenceJobRetry(ctx context.Context, db DBTX, arg *SequenceJobRetryParams) (*RiverJob, error) {
+	row := db.QueryRow(ctx, sequenceJobRetry, arg.Now, arg.ID, arg.Key)
+	var i RiverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Args,
+		&i.Attempt,
+		&i.AttemptedAt,
+		&i.AttemptedBy,
+		&i.CreatedAt,
+		&i.Errors,
+		&i.FinalizedAt,
+		&i.Kind,
+		&i.MaxAttempts,
+		&i.Metadata,
+		&i.Priority,
+		&i.Queue,
+		&i.State,
+		&i.ScheduledAt,
+		&i.Tags,
+		&i.SequenceKey,
+		&i.SequencePosition,
+		&i.SequenceContinueOnCancelled,
+		&i.SequenceContinueOnDiscarded,
+		&i.SequenceResolvedAt,
+		&i.UniqueKey,
+		&i.UniqueStates,
+	)
+	return &i, err
+}
+
+const sequenceJobStats = `-- name: SequenceJobStats :one
+WITH unresolved AS (
+    SELECT count(*)::bigint AS total,
+        count(*) FILTER (WHERE state = 'pending')::bigint AS pending
+    FROM /* TEMPLATE: schema */river_job
+    WHERE sequence_key = $1::text AND sequence_resolved_at IS NULL
+), active AS (
+    SELECT count(*)::bigint AS total,
+        count(*) FILTER (WHERE sequence_resolved_at IS NOT NULL)::bigint AS resolved
+    FROM /* TEMPLATE: schema */river_job
+    WHERE sequence_key = $1::text
+        AND (state IN ('available', 'running', 'retryable', 'scheduled')
+            OR (state = 'pending' AND sequence_resolved_at IS NOT NULL))
+)
+SELECT
+    coalesce((SELECT sequence_position FROM /* TEMPLATE: schema */river_job
+        WHERE sequence_key = $1::text ORDER BY sequence_position DESC LIMIT 1), 0)::bigint AS max_position,
+    unresolved.total::bigint AS unresolved,
+    (unresolved.pending + active.total)::bigint AS nonterminal,
+    active.resolved::bigint AS resolved_nonterminal,
+    active.total::bigint AS active
+FROM unresolved, active
+`
+
+type SequenceJobStatsRow struct {
+	MaxPosition         int64
+	Unresolved          int64
+	Nonterminal         int64
+	ResolvedNonterminal int64
+	Active              int64
+}
+
+func (q *Queries) SequenceJobStats(ctx context.Context, db DBTX, key string) (*SequenceJobStatsRow, error) {
+	row := db.QueryRow(ctx, sequenceJobStats, key)
+	var i SequenceJobStatsRow
+	err := row.Scan(
+		&i.MaxPosition,
+		&i.Unresolved,
+		&i.Nonterminal,
+		&i.ResolvedNonterminal,
+		&i.Active,
+	)
+	return &i, err
+}
+
+const sequenceOrphanList = `-- name: SequenceOrphanList :many
+SELECT DISTINCT sequence_key::text AS key
+FROM /* TEMPLATE: schema */river_job AS job
+WHERE sequence_key > $1::text
+    AND sequence_resolved_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */river_sequence_group AS sequence_group WHERE sequence_group.key = job.sequence_key)
+ORDER BY key
+LIMIT $2::bigint
+`
+
+type SequenceOrphanListParams struct {
+	AfterKey string
+	Max      int64
+}
+
+func (q *Queries) SequenceOrphanList(ctx context.Context, db DBTX, arg *SequenceOrphanListParams) ([]string, error) {
+	rows, err := db.Query(ctx, sequenceOrphanList, arg.AfterKey, arg.Max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sequenceSetLocalTimeouts = `-- name: SequenceSetLocalTimeouts :exec
+SELECT set_config('lock_timeout', '100ms', true), set_config('statement_timeout', '1500ms', true)
+`
+
+func (q *Queries) SequenceSetLocalTimeouts(ctx context.Context, db DBTX) error {
+	_, err := db.Exec(ctx, sequenceSetLocalTimeouts)
+	return err
+}
+
+const sequenceSetReadCommitted = `-- name: SequenceSetReadCommitted :exec
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+`
+
+func (q *Queries) SequenceSetReadCommitted(ctx context.Context, db DBTX) error {
+	_, err := db.Exec(ctx, sequenceSetReadCommitted)
+	return err
 }

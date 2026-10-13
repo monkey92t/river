@@ -14,6 +14,8 @@ import (
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivershared/testfactory"
+	"github.com/riverqueue/river/rivershared/util/dbutil"
+	"github.com/riverqueue/river/rivertype"
 )
 
 func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
@@ -75,6 +77,11 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 				driver.GetMigrationTruncateTables(riverdriver.MigrationLineMain, 7))
 			require.Equal(t, expectedLatestTables,
 				driver.GetMigrationTruncateTables(riverdriver.MigrationLineMain, 8))
+			if driver.DatabaseName() == riverdriver.DatabaseNamePostgres {
+				expectedLatestTables = append(expectedLatestTables, "river_sequence_group")
+			}
+			require.Equal(t, expectedLatestTables,
+				driver.GetMigrationTruncateTables(riverdriver.MigrationLineMain, 9))
 			require.Equal(t, expectedLatestTables,
 				driver.GetMigrationTruncateTables(riverdriver.MigrationLineMain, 0))
 		})
@@ -146,7 +153,7 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		}
 	})
 
-	t.Run("MigrateDownFromVersionEightWithJobData", func(t *testing.T) {
+	t.Run("MigrateDownFromVersionNineWithJobData", func(t *testing.T) {
 		t.Parallel()
 
 		driver, schema := driverWithSchema(ctx, t, &riverdbtest.TestSchemaOpts{
@@ -168,9 +175,11 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		})
 		require.NoError(t, err)
 
-		job, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
-		require.NoError(t, err)
-		require.NotZero(t, job.ID)
+		// The latest generated job model intentionally requires the new schema.
+		// Inspect the retained row directly after downgrading instead.
+		var retainedID int64
+		require.NoError(t, exec.QueryRow(ctx, fmt.Sprintf("SELECT id FROM %sriver_job WHERE id = %d", migrationSchemaPrefix(schema), job.ID)).Scan(&retainedID))
+		require.Equal(t, job.ID, retainedID)
 	})
 
 	t.Run("MigrateUpFromVersionSevenWithJobData", func(t *testing.T) {
@@ -184,7 +193,9 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		})
 		exec := driver.GetExecutor()
 
-		job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Schema: schema})
+		// Seed the old schema without projecting fields introduced by later migrations.
+		var jobID int64
+		require.NoError(t, exec.QueryRow(ctx, "INSERT INTO "+migrationSchemaPrefix(schema)+"river_job (kind, args) VALUES ('migration_fixture', '{}') RETURNING id").Scan(&jobID))
 
 		migrator, err := rivermigrate.New(driver, &rivermigrate.Config{
 			Line:   riverdriver.MigrationLineMain,
@@ -196,7 +207,7 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		_, err = migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
 		require.NoError(t, err)
 
-		job, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+		job, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: jobID, Schema: schema})
 		require.NoError(t, err)
 
 		_, err = exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schema})
@@ -248,6 +259,36 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.Equal(t, "queue-with-defaults", queue.Name)
 		require.NotZero(t, queue.UpdatedAt)
+	})
+
+	t.Run("MigrateSequenceDownRejectsDurableMembers", func(t *testing.T) {
+		t.Parallel()
+
+		driver, schema := driverWithSchema(ctx, t, &riverdbtest.TestSchemaOpts{DisableReuse: true})
+		if driver.DatabaseName() != riverdriver.DatabaseNamePostgres {
+			t.Skip("sequence schema is Postgres-only")
+		}
+		exec := driver.GetExecutor()
+		sequenceExec, ok := exec.(riverdriver.SequenceExecutor)
+		require.True(t, ok)
+		job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Schema: schema, State: new(rivertype.JobStatePending)})
+		_, err := sequenceExec.SequenceJobAttach(ctx, &riverdriver.SequenceJobAttachParams{ID: job.ID, Key: "durable", Position: 1, Schema: schema})
+		require.NoError(t, err)
+		migrator, err := rivermigrate.New(driver, &rivermigrate.Config{Logger: riversharedtest.Logger(t), Schema: schema})
+		require.NoError(t, err)
+		_, err = migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{TargetVersion: 8})
+		require.ErrorContains(t, err, "cannot remove sequences while sequence groups or members remain")
+		retained, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStatePending, retained.State)
+		require.Equal(t, "durable", *retained.SequenceKey)
+
+		// Persistent group policy alone is sufficient to prevent accidental removal.
+		_, err = exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schema})
+		require.NoError(t, err)
+		require.NoError(t, sequenceExec.SequenceGroupEnsure(ctx, &riverdriver.SequenceGroupKeyParams{Key: "durable", Schema: schema}))
+		_, err = migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{TargetVersion: 8})
+		require.ErrorContains(t, err, "cannot remove sequences while sequence groups or members remain")
 	})
 
 	t.Run("MigrateVersionEightRejectsProSchema", func(t *testing.T) {
@@ -537,4 +578,12 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		require.Equal(t, riverdriver.MigrationLineMain, migrations[1].Line)
 		require.Equal(t, 2, migrations[1].Version)
 	})
+}
+
+// migrationSchemaPrefix safely qualifies fixtures used against historical schemas.
+func migrationSchemaPrefix(schema string) string {
+	if schema == "" {
+		return ""
+	}
+	return dbutil.SafeIdentifier(schema) + "."
 }

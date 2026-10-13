@@ -16,6 +16,8 @@
     "postgresql/main/007_notification_outbox_sqlite_jsonb_and_sql_cleanup.up.sql": "af01339fcb1687de1f768a570b6ad1e51d23300082aed60440f6a662a0e39d85",
     "postgresql/main/008_job_id_autoincrement.down.sql": "678b3b02deb2f798c3fda3a73c974fc1fe48c6b88688b94f0f7700132b30626f",
     "postgresql/main/008_job_id_autoincrement.up.sql": "678b3b02deb2f798c3fda3a73c974fc1fe48c6b88688b94f0f7700132b30626f",
+    "postgresql/main/009_sequences.down.sql": "b1477295fd3ce5efd4a61baa5f271a384634bb22d7b5963dd133cf8dd448e0cf",
+    "postgresql/main/009_sequences.up.sql": "413dd25f464c429181c4cb1ae660b5c3a553c676d8980333d7bc4ebc56a80bd7",
     "sqlite/main/001_create_river_migration.down.sql": "34c87dc594bf7520bc3ae69f6f0da8d2d9a472616ab38b37e63d4e3838da06d2",
     "sqlite/main/001_create_river_migration.up.sql": "d15597cb0bb884fb0727d2a29ad8313842708b55fd561a5fe62e37aad5f34298",
     "sqlite/main/002_initial_schema.down.sql": "900508ba08d0ca3c8451eb2854cd9ab837166ef55736393524253b6228438470",
@@ -31,7 +33,9 @@
     "sqlite/main/007_notification_outbox_sqlite_jsonb_and_sql_cleanup.down.sql": "55bffeb528b40dffc0cbec2f22d1463aef37a8b3d7977f83729cc505bb77c745",
     "sqlite/main/007_notification_outbox_sqlite_jsonb_and_sql_cleanup.up.sql": "441a05e1d9aa4f151877ccf725b0b0a86f27013442297d4b621c05676270d0b0",
     "sqlite/main/008_job_id_autoincrement.down.sql": "04871283fe5d4cab4ac70da28d8509aa7ba765994d528c2dcc7ebe0ee596710c",
-    "sqlite/main/008_job_id_autoincrement.up.sql": "3ce6d941f4c434adbd87e69089fa5e99b6047e5b51e611c9845e1d0d3c080e0f"
+    "sqlite/main/008_job_id_autoincrement.up.sql": "3ce6d941f4c434adbd87e69089fa5e99b6047e5b51e611c9845e1d0d3c080e0f",
+    "sqlite/main/009_sequences.down.sql": "4d3eaa625d0880789a30c76a5aa0c2d4f4c5934b91fdf65757e99f452fd7d206",
+    "sqlite/main/009_sequences.up.sql": "4d3eaa625d0880789a30c76a5aa0c2d4f4c5934b91fdf65757e99f452fd7d206"
   },
   "source": "riverdriver/"
 }

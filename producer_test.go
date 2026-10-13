@@ -381,22 +381,26 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 	ctx := context.Background()
 
 	type testBundle struct {
-		archetype       *baseservice.Archetype
-		completer       jobcompleter.JobCompleter
-		config          *Config
-		exec            riverdriver.Executor
-		jobUpdates      chan jobcompleter.CompleterJobUpdated
-		queue           string
-		timeBeforeStart time.Time
-		workers         *Workers
+		archetype  *baseservice.Archetype
+		completer  jobcompleter.JobCompleter
+		config     *Config
+		exec       riverdriver.Executor
+		insertTime time.Time
+		jobUpdates chan jobcompleter.CompleterJobUpdated
+		queue      string
+		workers    *Workers
 	}
 
 	setup := func(t *testing.T) (*producer, *testBundle) {
 		t.Helper()
 
-		timeBeforeStart := time.Now().UTC()
-
 		producer, jobUpdates := makeProducer(ctx, t)
+
+		// Use the database clock that the fetch query uses. Transaction-backed
+		// producers see a fixed now(), which may precede the host clock even
+		// when the transaction starts after this test due to clock skew.
+		var insertTime time.Time
+		require.NoError(t, producer.exec.QueryRow(ctx, "SELECT CURRENT_TIMESTAMP").Scan(&insertTime))
 		producer.testSignals.Init(t)
 		config := newTestConfig(t, producer.config.Schema)
 
@@ -410,14 +414,14 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		}()
 
 		return producer, &testBundle{
-			archetype:       &producer.Archetype,
-			completer:       producer.completer,
-			config:          config,
-			exec:            producer.exec,
-			jobUpdates:      jobUpdatesFlattened,
-			queue:           producer.config.Queue,
-			timeBeforeStart: timeBeforeStart,
-			workers:         producer.workers,
+			archetype:  &producer.Archetype,
+			completer:  producer.completer,
+			config:     config,
+			exec:       producer.exec,
+			insertTime: insertTime,
+			jobUpdates: jobUpdatesFlattened,
+			queue:      producer.config.Queue,
+			workers:    producer.workers,
 		}
 	}
 
@@ -429,15 +433,10 @@ func testProducer(t *testing.T, makeProducer func(ctx context.Context, t *testin
 		})
 		require.NoError(t, err)
 		if insertParams.ScheduledAt == nil {
-			// Without this, newly inserted jobs will pick up a scheduled_at time
-			// that's the current Go time at the time of insertion. If the test is
-			// using a transaction, this will be after the `now()` time in the
-			// transaction that gets used by default in `JobGetAvailable`, so new jobs
-			// won't be visible.
-			//
-			// To work around this, set all inserted jobs to a time before the start
-			// of the test to ensure they're visible.
-			insertParams.ScheduledAt = &bundle.timeBeforeStart
+			// Both inserts and fetches must use the same database clock. A
+			// host timestamp can be later than a transaction's fixed now(),
+			// making a due fixture permanently invisible to this producer.
+			insertParams.ScheduledAt = &bundle.insertTime
 		}
 
 		_, err = bundle.exec.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{

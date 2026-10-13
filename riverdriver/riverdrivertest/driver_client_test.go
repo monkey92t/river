@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"math"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -325,6 +328,7 @@ func ExerciseClient[TTx any](ctx context.Context, t *testing.T,
 	t.Helper()
 
 	exerciseClientJobUpdate(ctx, t, driverWithSchema)
+	exerciseClientSequences(ctx, t, driverWithSchema)
 
 	type testBundle struct {
 		config *river.Config
@@ -1959,5 +1963,703 @@ func ExerciseClient[TTx any](ctx context.Context, t *testing.T,
 		require.Len(t, job.Errors, 1)
 		require.Equal(t, 1, job.Errors[0].Attempt)
 		require.Contains(t, job.Errors[0].Error, "job row couldn't be decoded: error unmarshaling `tags`")
+	})
+}
+
+// sequenceClientArgs keeps policy and payload outside the grouping fingerprint.
+type sequenceClientArgs struct {
+	Account   string `json:"account"   river:"sequence"`
+	Cancel    bool   `json:"cancel"`
+	Discard   bool   `json:"discard"`
+	Operation int    `json:"operation"`
+}
+
+// Kind identifies the shared sequence conformance worker.
+func (sequenceClientArgs) Kind() string { return "sequence_client" }
+
+// SequenceOpts orders one account and persists each member's terminal policy.
+func (args sequenceClientArgs) SequenceOpts() river.SequenceOpts {
+	return river.SequenceOpts{ByArgs: true, ContinueOnCancelled: args.Cancel, ContinueOnDiscarded: args.Discard}
+}
+
+// sequenceSetState uses the same batch completion API as normal workers.
+func sequenceSetState(ctx context.Context, t *testing.T, exec riverdriver.Executor, schema string, params ...*riverdriver.JobSetStateIfRunningParams) {
+	t.Helper()
+
+	batch := &riverdriver.JobSetStateIfRunningManyParams{Schema: schema}
+	for _, param := range params {
+		batch.ID = append(batch.ID, param.ID)
+		batch.Attempt = append(batch.Attempt, param.Attempt)
+		batch.ErrData = append(batch.ErrData, param.ErrData)
+		batch.FinalizedAt = append(batch.FinalizedAt, param.FinalizedAt)
+		batch.MetadataDoMerge = append(batch.MetadataDoMerge, param.MetadataDoMerge)
+		batch.MetadataUpdates = append(batch.MetadataUpdates, param.MetadataUpdates)
+		batch.ScheduledAt = append(batch.ScheduledAt, param.ScheduledAt)
+		batch.State = append(batch.State, param.State)
+	}
+	rows, err := exec.JobSetStateIfRunningMany(ctx, batch)
+	require.NoError(t, err)
+	require.Len(t, rows, len(params))
+}
+
+// exerciseClientSequences checks ordering and failure isolation across drivers.
+func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
+	driverWithSchema func(context.Context, *testing.T) (riverdriver.Driver[TTx], string),
+) {
+	t.Helper()
+
+	type testBundle struct {
+		client *river.Client[TTx]
+		driver riverdriver.Driver[TTx]
+		exec   riverdriver.Executor
+		schema string
+	}
+
+	setup := func(t *testing.T) *testBundle {
+		t.Helper()
+
+		driver, schema := driverWithSchema(ctx, t)
+		config := newTestConfig(t, schema)
+		if driver.DatabaseName() == riverdriver.DatabaseNamePostgres {
+			// Immediate claims use the database clock. Pin default insert and
+			// retry times to that clock so host skew cannot place fixtures after
+			// a fetch transaction's now(). Explicit ScheduledAt still overrides it.
+			var now time.Time
+			require.NoError(t, driver.GetExecutor().QueryRow(ctx, "SELECT CURRENT_TIMESTAMP").Scan(&now))
+			timeStub, ok := config.Test.Time.(*riversharedtest.TimeStub)
+			require.True(t, ok)
+			timeStub.StubNow(now)
+		}
+		config.Sequences = river.SequenceConfig{AcceptNewJobs: true, DisableReconciler: true}
+		river.AddWorker(config.Workers, river.WorkFunc(func(context.Context, *river.Job[sequenceClientArgs]) error { return nil }))
+		client, err := river.NewClient(driver, config)
+		require.NoError(t, err)
+		return &testBundle{client: client, driver: driver, exec: driver.GetExecutor(), schema: schema}
+	}
+	postgres := func(t *testing.T) *testBundle {
+		t.Helper()
+
+		bundle := setup(t)
+		if bundle.driver.DatabaseName() != riverdriver.DatabaseNamePostgres {
+			t.Skip("sequences require Postgres")
+		}
+		return bundle
+	}
+	insert := func(t *testing.T, bundle *testBundle, args sequenceClientArgs, opts *river.InsertOpts) *rivertype.JobRow {
+		t.Helper()
+
+		result, err := bundle.client.Insert(ctx, args, opts)
+		require.NoError(t, err)
+		require.NotNil(t, result.Job.SequenceKey)
+		return result.Job
+	}
+	state := func(t *testing.T, bundle *testBundle, id int64, expected rivertype.JobState) *rivertype.JobRow {
+		t.Helper()
+
+		job, err := bundle.client.JobGet(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, expected, job.State)
+		return job
+	}
+	reconcile := func(t *testing.T, bundle *testBundle, key string) {
+		t.Helper()
+
+		_, err := bundle.client.SequenceReconcile(ctx, key)
+		require.NoError(t, err)
+	}
+	claim := func(t *testing.T, bundle *testBundle) []*rivertype.JobRow {
+		t.Helper()
+
+		result, err := bundle.exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+			ClientID: "sequence_conformance", MaxAttemptedBy: 5, MaxToLock: 100, Queue: river.QueueDefault, Schema: bundle.schema,
+		})
+		require.NoError(t, err)
+		return result.Jobs
+	}
+
+	t.Run("Sequences", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("BypassAndRestore", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			ordinary, err := bundle.client.Insert(ctx, noOpArgs{}, &river.InsertOpts{Pending: true})
+			require.NoError(t, err)
+			key := *first.SequenceKey
+			reconcile(t, bundle, key)
+			require.Len(t, claim(t, bundle), 1)
+			require.NoError(t, bundle.client.SequenceBypass(ctx, key, &river.SequenceActionOpts{Reason: "test recovery"}))
+			_, err = bundle.client.Insert(ctx, sequenceClientArgs{Account: "a"}, nil)
+			require.ErrorIs(t, err, river.ErrSequenceBypass)
+			reconcile(t, bundle, key)
+			require.NotNil(t, state(t, bundle, first.ID, rivertype.JobStateRunning).SequenceResolvedAt)
+			require.NotNil(t, state(t, bundle, second.ID, rivertype.JobStateAvailable).SequenceResolvedAt)
+			state(t, bundle, ordinary.Job.ID, rivertype.JobStatePending)
+			err = bundle.client.SequenceRestore(ctx, key, &river.SequenceActionOpts{Reason: "too early"})
+			require.ErrorIs(t, err, river.ErrSequenceNotDrained)
+			require.Len(t, claim(t, bundle), 1)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema,
+				riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil), riverdriver.JobSetStateCompleted(second.ID, time.Now(), nil))
+			require.NoError(t, bundle.client.SequenceRestore(ctx, key, &river.SequenceActionOpts{Reason: "drained"}))
+			next := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 3}, nil)
+			require.Greater(t, *next.SequencePosition, *second.SequencePosition)
+			reconcile(t, bundle, key)
+			state(t, bundle, next.ID, rivertype.JobStateAvailable)
+		})
+
+		for _, continued := range []bool{false, true} {
+			t.Run(fmt.Sprintf("CancellationPolicy/%t", continued), func(t *testing.T) {
+				t.Parallel()
+
+				bundle := postgres(t)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: continued}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: !continued, Operation: 2}, nil)
+				_, err := bundle.client.JobCancel(ctx, first.ID)
+				require.NoError(t, err)
+				reconcile(t, bundle, *first.SequenceKey)
+				if continued {
+					state(t, bundle, second.ID, rivertype.JobStateAvailable)
+					return
+				}
+				state(t, bundle, second.ID, rivertype.JobStatePending)
+				info, err := bundle.client.SequenceGet(ctx, *first.SequenceKey)
+				require.NoError(t, err)
+				require.Equal(t, "blocked", info.Mode)
+				_, err = bundle.client.JobRetry(ctx, second.ID)
+				require.ErrorIs(t, err, river.ErrSequenceBlocked)
+				require.NoError(t, bundle.client.SequenceResume(ctx, *first.SequenceKey, &river.SequenceResumeOpts{
+					ExpectedJobID: first.ID, ExpectedPosition: *first.SequencePosition, Reason: "skip terminal barrier",
+				}))
+				reconcile(t, bundle, *first.SequenceKey)
+				state(t, bundle, second.ID, rivertype.JobStateAvailable)
+			})
+		}
+
+		for _, continued := range []bool{false, true} {
+			t.Run(fmt.Sprintf("DiscardPolicy/%t", continued), func(t *testing.T) {
+				t.Parallel()
+
+				bundle := postgres(t)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: continued}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: !continued, Operation: 2}, nil)
+				reconcile(t, bundle, *first.SequenceKey)
+				require.Len(t, claim(t, bundle), 1)
+				sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateDiscarded(first.ID, time.Now(), nil, nil))
+				reconcile(t, bundle, *first.SequenceKey)
+				if continued {
+					state(t, bundle, second.ID, rivertype.JobStateAvailable)
+				} else {
+					state(t, bundle, second.ID, rivertype.JobStatePending)
+					info, err := bundle.client.SequenceGet(ctx, *first.SequenceKey)
+					require.NoError(t, err)
+					require.Equal(t, "blocked", info.Mode)
+					require.Equal(t, "discarded", *info.BlockedReason)
+				}
+			})
+		}
+
+		t.Run("CleanerRetainsTerminalEvidence", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: true}, nil)
+			_, err := bundle.client.JobCancel(ctx, first.ID)
+			require.NoError(t, err)
+			params := &riverdriver.JobDeleteBeforeParams{CancelledDoDelete: true, CancelledFinalizedAtHorizon: time.Now().Add(time.Hour), Max: 100, Schema: bundle.schema}
+			count, err := bundle.exec.JobDeleteBefore(ctx, params)
+			require.NoError(t, err)
+			require.Zero(t, count)
+			reconcile(t, bundle, *first.SequenceKey)
+			count, err = bundle.exec.JobDeleteBefore(ctx, params)
+			require.NoError(t, err)
+			require.Equal(t, 1, count)
+		})
+
+		t.Run("ConcurrentInsertAndNoSecondHead", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			const count = 12
+			rows := make([]*rivertype.JobInsertResult, count)
+			errs := make([]error, count)
+			var workers sync.WaitGroup
+			for index := range count {
+				workers.Go(func() {
+					rows[index], errs[index] = bundle.client.Insert(ctx, sequenceClientArgs{Account: "a", Operation: index}, nil)
+				})
+			}
+			workers.Wait()
+			positions := make(map[int64]bool)
+			for index, err := range errs {
+				require.NoError(t, err)
+				position := *rows[index].Job.SequencePosition
+				require.False(t, positions[position])
+				positions[position] = true
+			}
+			key := *rows[0].Job.SequenceKey
+			for expected := int64(1); expected <= count; expected++ {
+				reconcile(t, bundle, key)
+				jobs := claim(t, bundle)
+				require.Len(t, jobs, 1)
+				require.Equal(t, expected, *jobs[0].SequencePosition)
+				sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(jobs[0].ID, time.Now(), nil))
+			}
+			reconcile(t, bundle, key)
+			info, err := bundle.client.SequenceGet(ctx, key)
+			require.NoError(t, err)
+			require.Zero(t, info.UnresolvedCount)
+		})
+
+		t.Run("CoordinatorConnectionLossBeforeCommit", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			tx, err := bundle.exec.Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+			var backendPID int
+			require.NoError(t, tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPID))
+			result, err := bundle.client.SequenceReconcileTx(ctx, bundle.driver.UnwrapTx(tx), *first.SequenceKey)
+			require.NoError(t, err)
+			require.Equal(t, first.ID, result.JobReleased.ID)
+			// Terminate only the backend owned by this test's uncommitted transaction.
+			var terminated bool
+			require.NoError(t, bundle.exec.QueryRow(ctx, "SELECT pg_terminate_backend($1)", backendPID).Scan(&terminated))
+			require.True(t, terminated)
+			require.Error(t, tx.Commit(ctx))
+			state(t, bundle, first.ID, rivertype.JobStatePending)
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, first.ID, rivertype.JobStateAvailable)
+			require.Len(t, claim(t, bundle), 1)
+		})
+
+		t.Run("DeletedBarrierRequiresResume", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			_, err := bundle.client.JobCancel(ctx, first.ID)
+			require.NoError(t, err)
+			reconcile(t, bundle, *first.SequenceKey)
+			_, err = bundle.client.JobDelete(ctx, first.ID)
+			require.NoError(t, err)
+			_, err = bundle.client.JobRetry(ctx, second.ID)
+			require.ErrorIs(t, err, river.ErrSequenceBlocked)
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			require.NoError(t, bundle.client.SequenceResume(ctx, *first.SequenceKey, &river.SequenceResumeOpts{
+				ExpectedJobID: first.ID, ExpectedPosition: *first.SequencePosition, Reason: "explicitly skip deleted barrier",
+			}))
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, second.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("GroupLossRepairsPositionBeforeInsert", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			require.NoError(t, bundle.exec.Exec(ctx, fmt.Sprintf("DELETE FROM %s.river_sequence_group", bundle.schema)))
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			require.Greater(t, *second.SequencePosition, *first.SequencePosition)
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, first.ID, rivertype.JobStateAvailable)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+		})
+
+		t.Run("GroupTableFailureDoesNotFailCoreCompletion", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			reconcile(t, bundle, *first.SequenceKey)
+			ordinary, err := bundle.client.Insert(ctx, noOpArgs{}, nil)
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 2)
+			query := fmt.Sprintf("ALTER TABLE %s.river_sequence_group RENAME TO sequence_unavailable", bundle.schema)
+			require.NoError(t, bundle.exec.Exec(ctx, query))
+			defer func() {
+				require.NoError(t, bundle.exec.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.sequence_unavailable RENAME TO river_sequence_group", bundle.schema)))
+			}()
+			_, err = bundle.client.SequenceReconcile(ctx, *first.SequenceKey)
+			require.Error(t, err)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema,
+				riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil), riverdriver.JobSetStateCompleted(ordinary.Job.ID, time.Now(), nil))
+			state(t, bundle, first.ID, rivertype.JobStateCompleted)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			state(t, bundle, ordinary.Job.ID, rivertype.JobStateCompleted)
+			_, err = bundle.client.Insert(ctx, noOpArgs{}, nil)
+			require.NoError(t, err)
+			_, err = bundle.client.JobRetry(ctx, ordinary.Job.ID)
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 2)
+		})
+
+		t.Run("InsertTxRollbackAndVisibility", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			execTx, err := bundle.exec.Begin(ctx)
+			require.NoError(t, err)
+			defer execTx.Rollback(ctx)
+			result, err := bundle.client.InsertTx(ctx, bundle.driver.UnwrapTx(execTx), sequenceClientArgs{Account: "a"}, nil)
+			require.NoError(t, err)
+			_, err = bundle.client.JobGet(ctx, result.Job.ID)
+			require.ErrorIs(t, err, rivertype.ErrNotFound)
+			require.NoError(t, execTx.Rollback(ctx))
+			_, err = bundle.client.SequenceGet(ctx, *result.Job.SequenceKey)
+			require.ErrorIs(t, err, rivertype.ErrNotFound)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			require.Equal(t, int64(1), *first.SequencePosition)
+		})
+
+		t.Run("LockedHeadCannotBeSkipped", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			execTx, err := bundle.exec.Begin(ctx)
+			require.NoError(t, err)
+			defer execTx.Rollback(ctx)
+			sequenceExec, ok := execTx.(riverdriver.SequenceExecutor)
+			require.True(t, ok)
+			_, err = sequenceExec.SequenceJobGet(ctx, &riverdriver.SequenceJobGetParams{ID: first.ID, Key: *first.SequenceKey, Schema: bundle.schema})
+			require.NoError(t, err)
+			_, err = bundle.client.SequenceReconcile(ctx, *first.SequenceKey)
+			require.Error(t, err)
+			state(t, bundle, first.ID, rivertype.JobStatePending)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			require.NoError(t, execTx.Rollback(ctx))
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, first.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("ReconcileRollbackLeavesDurableFrontierUnchanged", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			key := *first.SequenceKey
+			reconcile(t, bundle, key)
+			require.Len(t, claim(t, bundle), 1)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil))
+			tx, err := bundle.driver.GetExecutor().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+			result, err := bundle.client.SequenceReconcileTx(ctx, bundle.driver.UnwrapTx(tx), key)
+			require.NoError(t, err)
+			require.Equal(t, second.ID, result.JobReleased.ID)
+			require.NoError(t, tx.Rollback(ctx))
+			require.Nil(t, state(t, bundle, first.ID, rivertype.JobStateCompleted).SequenceResolvedAt)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			reconcile(t, bundle, key)
+			require.NotNil(t, state(t, bundle, first.ID, rivertype.JobStateCompleted).SequenceResolvedAt)
+			state(t, bundle, second.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("RetryDoesNotLetFollowersPass", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			_, err := bundle.client.JobRetry(ctx, second.ID)
+			require.ErrorIs(t, err, river.ErrSequenceNotHead)
+			reconcile(t, bundle, *first.SequenceKey)
+			require.Len(t, claim(t, bundle), 1)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateErrorRetryable(first.ID, time.Now().Add(time.Hour), nil, nil))
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			_, err = bundle.client.JobRetry(ctx, first.ID)
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 1)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil))
+			reconcile(t, bundle, *first.SequenceKey)
+			_, err = bundle.client.JobRetry(ctx, first.ID)
+			require.ErrorIs(t, err, river.ErrSequenceAlreadyResolved)
+			state(t, bundle, second.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("RetrySnoozeAndRescueSurviveGroupStorageFailure", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+			reconcile(t, bundle, *first.SequenceKey)
+			ordinary, err := bundle.client.Insert(ctx, noOpArgs{}, nil)
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 2)
+			require.NoError(t, bundle.exec.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.river_sequence_group RENAME TO sequence_unavailable", bundle.schema)))
+			defer func() {
+				require.NoError(t, bundle.exec.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.sequence_unavailable RENAME TO river_sequence_group", bundle.schema)))
+			}()
+			past := time.Now().Add(-time.Minute)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateErrorRetryable(first.ID, past, []byte(`{"error":"transient"}`), nil))
+			_, err = bundle.exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{Max: 10, Schema: bundle.schema})
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 1)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateSnoozed(first.ID, past, 1, nil))
+			_, err = bundle.exec.JobSchedule(ctx, &riverdriver.JobScheduleParams{Max: 10, Schema: bundle.schema})
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 1)
+			_, err = bundle.exec.JobRescueMany(ctx, &riverdriver.JobRescueManyParams{
+				ID:           []int64{first.ID, ordinary.Job.ID},
+				Error:        [][]byte{[]byte(`{"error":"rescued"}`), []byte(`{"error":"rescued"}`)},
+				FinalizedAt:  []*time.Time{nil, nil},
+				ScheduledAt:  []time.Time{past, past},
+				Schema:       bundle.schema,
+				State:        []string{"available", "available"},
+				StuckHorizon: time.Now().Add(time.Hour),
+			})
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 2)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema,
+				riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil), riverdriver.JobSetStateCompleted(ordinary.Job.ID, time.Now(), nil))
+			state(t, bundle, first.ID, rivertype.JobStateCompleted)
+			state(t, bundle, ordinary.Job.ID, rivertype.JobStateCompleted)
+		})
+
+		t.Run("ScheduledFollowerAndIndependentGroup", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			future := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, &river.InsertOpts{ScheduledAt: future})
+			third := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 3}, nil)
+			other := insert(t, bundle, sequenceClientArgs{Account: "b"}, nil)
+			reconcile(t, bundle, *first.SequenceKey)
+			reconcile(t, bundle, *other.SequenceKey)
+			state(t, bundle, second.ID, rivertype.JobStatePending)
+			state(t, bundle, third.ID, rivertype.JobStatePending)
+			require.Len(t, claim(t, bundle), 2)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil))
+			reconcile(t, bundle, *first.SequenceKey)
+			require.Equal(t, future, state(t, bundle, second.ID, rivertype.JobStateScheduled).ScheduledAt)
+			state(t, bundle, third.ID, rivertype.JobStatePending)
+			require.Empty(t, claim(t, bundle))
+		})
+
+		t.Run("TerminalChainBeyondBatchLimit", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			const count = 75
+			params := make([]river.InsertManyParams, count)
+			for index := range count {
+				params[index] = river.InsertManyParams{Args: sequenceClientArgs{Account: "a", Cancel: true, Operation: index}}
+			}
+			jobs, err := bundle.client.InsertMany(ctx, params)
+			require.NoError(t, err)
+			for _, job := range jobs {
+				_, err := bundle.client.JobCancel(ctx, job.Job.ID)
+				require.NoError(t, err)
+			}
+			key := *jobs[0].Job.SequenceKey
+			for range 3 {
+				reconcile(t, bundle, key)
+			}
+			info, err := bundle.client.SequenceGet(ctx, key)
+			require.NoError(t, err)
+			require.Zero(t, info.UnresolvedCount)
+			next := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: count}, nil)
+			reconcile(t, bundle, key)
+			state(t, bundle, next.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("UniqueBatchConflictAndCrossGroupDuplicate", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			opts := &river.InsertOpts{UniqueOpts: river.UniqueOpts{ByQueue: true}}
+			jobs, err := bundle.client.InsertMany(ctx, []river.InsertManyParams{
+				{Args: sequenceClientArgs{Account: "a"}, InsertOpts: opts},
+				{Args: sequenceClientArgs{Account: "b"}, InsertOpts: opts},
+				{Args: sequenceClientArgs{Account: "b"}, InsertOpts: opts},
+			})
+			// Core bulk insertion rejects repeated updates to the same unique row.
+			// Sequence preparation must roll back with that original driver error.
+			require.Error(t, err)
+			require.Empty(t, jobs)
+			var count int
+			require.NoError(t, bundle.exec.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s.river_job", bundle.schema)).Scan(&count))
+			require.Zero(t, count)
+			require.NoError(t, bundle.exec.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s.river_sequence_group", bundle.schema)).Scan(&count))
+			require.Zero(t, count)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, opts)
+			duplicate, err := bundle.client.Insert(ctx, sequenceClientArgs{Account: "b"}, opts)
+			require.NoError(t, err)
+			require.True(t, duplicate.UniqueSkippedAsDuplicate)
+			require.Equal(t, first.ID, duplicate.Job.ID)
+			require.Equal(t, first.SequenceKey, duplicate.Job.SequenceKey)
+			require.Equal(t, first.SequencePosition, duplicate.Job.SequencePosition)
+			other := insert(t, bundle, sequenceClientArgs{Account: "b"}, nil)
+			require.EqualValues(t, 1, *other.SequencePosition)
+			require.NotEqual(t, *first.SequenceKey, *other.SequenceKey)
+			reconcile(t, bundle, *first.SequenceKey)
+			reconcile(t, bundle, *other.SequenceKey)
+			require.Len(t, claim(t, bundle), 2)
+		})
+
+		t.Run("UniqueDuplicatePreservesMembership", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			opts := &river.InsertOpts{UniqueOpts: river.UniqueOpts{ByArgs: true}}
+			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, opts)
+			duplicate, err := bundle.client.Insert(ctx, sequenceClientArgs{Account: "a"}, opts)
+			require.NoError(t, err)
+			require.True(t, duplicate.UniqueSkippedAsDuplicate)
+			require.Equal(t, first.ID, duplicate.Job.ID)
+			require.Equal(t, first.SequencePosition, duplicate.Job.SequencePosition)
+			next := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, opts)
+			require.Greater(t, *next.SequencePosition, *first.SequencePosition)
+			reconcile(t, bundle, *first.SequenceKey)
+			require.Len(t, claim(t, bundle), 1)
+			sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil))
+			reconcile(t, bundle, *first.SequenceKey)
+			state(t, bundle, next.ID, rivertype.JobStateAvailable)
+		})
+
+		t.Run("UnsupportedDriverKeepsOrdinaryJobs", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := setup(t)
+			if bundle.driver.DatabaseName() == riverdriver.DatabaseNamePostgres {
+				t.Skip("tests unsupported drivers")
+			}
+			_, err := bundle.client.Insert(ctx, sequenceClientArgs{Account: "a"}, nil)
+			require.ErrorIs(t, err, river.ErrSequenceNotSupported)
+			_, err = bundle.client.Insert(ctx, noOpArgs{}, nil)
+			require.NoError(t, err)
+			require.Len(t, claim(t, bundle), 1)
+		})
+
+		t.Run("TwoCoordinatorsDrainWithAcceptanceDisabled", func(t *testing.T) {
+			t.Parallel()
+
+			bundle := postgres(t)
+			const count = 6
+			jobs := make([]*rivertype.JobRow, count)
+			for index := range count {
+				jobs[index] = insert(t, bundle, sequenceClientArgs{Account: "a", Operation: index}, nil)
+			}
+			config := newTestConfig(t, bundle.schema)
+			config.PollOnly = true
+			config.Sequences = river.SequenceConfig{PollInterval: 10 * time.Millisecond}
+			var active atomic.Int32
+			var overlap atomic.Bool
+			var mutex sync.Mutex
+			var operations []int
+			river.AddWorker(config.Workers, river.WorkFunc(func(ctx context.Context, job *river.Job[sequenceClientArgs]) error {
+				if active.Add(1) != 1 {
+					overlap.Store(true)
+				}
+				defer active.Add(-1)
+				mutex.Lock()
+				operations = append(operations, job.Args.Operation)
+				mutex.Unlock()
+				// Keep the head executing across multiple coordinator polls.
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(30 * time.Millisecond):
+					return nil
+				}
+			}))
+			for range 2 {
+				client, err := river.NewClient(bundle.driver, config)
+				require.NoError(t, err)
+				startClient(ctx, t, client)
+			}
+			require.Eventually(t, func() bool {
+				for _, job := range jobs {
+					current, err := bundle.client.JobGet(ctx, job.ID)
+					if err != nil || current.State != rivertype.JobStateCompleted {
+						return false
+					}
+				}
+				return true
+			}, 10*time.Second, 20*time.Millisecond)
+			require.False(t, overlap.Load())
+			mutex.Lock()
+			defer mutex.Unlock()
+			require.Equal(t, []int{0, 1, 2, 3, 4, 5}, operations)
+		})
+
+		t.Run("WorkerLifecycleWithoutNotifications", func(t *testing.T) {
+			t.Parallel()
+
+			driver, schema := driverWithSchema(ctx, t)
+			if driver.DatabaseName() != riverdriver.DatabaseNamePostgres {
+				t.Skip("sequences require Postgres")
+			}
+			config := newTestConfig(t, schema)
+			config.PollOnly = true
+			config.Sequences = river.SequenceConfig{AcceptNewJobs: true, PollInterval: 10 * time.Millisecond}
+			var mutex sync.Mutex
+			var operations []int
+			river.AddWorker(config.Workers, river.WorkFunc(func(_ context.Context, job *river.Job[sequenceClientArgs]) error {
+				mutex.Lock()
+				defer mutex.Unlock()
+				operations = append(operations, job.Args.Operation)
+				return nil
+			}))
+			client, err := river.NewClient(driver, config)
+			require.NoError(t, err)
+			const count = 5
+			params := make([]river.InsertManyParams, count)
+			for index := range count {
+				params[index] = river.InsertManyParams{Args: sequenceClientArgs{Account: "a", Operation: index}}
+			}
+			_, err = client.InsertMany(ctx, params)
+			require.NoError(t, err)
+			events := subscribe(t, client)
+			startClient(ctx, t, client)
+			for range count {
+				event := riversharedtest.WaitOrTimeout(t, events)
+				require.Equal(t, river.EventKindJobCompleted, event.Kind)
+			}
+			mutex.Lock()
+			defer mutex.Unlock()
+			require.Equal(t, []int{0, 1, 2, 3, 4}, operations)
+		})
+
+		t.Run("WorkerSurvivesUnavailableSequenceTable", func(t *testing.T) {
+			t.Parallel()
+
+			driver, schema := driverWithSchema(ctx, t)
+			if driver.DatabaseName() != riverdriver.DatabaseNamePostgres {
+				t.Skip("sequences require Postgres")
+			}
+			exec := driver.GetExecutor()
+			require.NoError(t, exec.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.river_sequence_group RENAME TO sequence_unavailable", schema)))
+			t.Cleanup(func() {
+				require.NoError(t, exec.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.sequence_unavailable RENAME TO river_sequence_group", schema)))
+			})
+			config := newTestConfig(t, schema)
+			config.Sequences = river.SequenceConfig{PollInterval: 10 * time.Millisecond}
+			client, err := river.NewClient(driver, config)
+			require.NoError(t, err)
+			events := subscribe(t, client)
+			startClient(ctx, t, client)
+			inserted, err := client.Insert(ctx, noOpArgs{}, nil)
+			require.NoError(t, err)
+			event := riversharedtest.WaitOrTimeout(t, events)
+			require.Equal(t, river.EventKindJobCompleted, event.Kind)
+			require.Equal(t, inserted.Job.ID, event.Job.ID)
+			require.Eventually(t, func() bool { return client.SequenceStatus().ConsecutiveErrors > 0 }, time.Second, 10*time.Millisecond)
+		})
 	})
 }

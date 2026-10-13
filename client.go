@@ -1,13 +1,17 @@
 package river
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -28,6 +32,7 @@ import (
 	"github.com/riverqueue/river/internal/retrypolicy"
 	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/internal/riverplugin"
+	sequenceruntime "github.com/riverqueue/river/internal/sequence"
 	"github.com/riverqueue/river/internal/workunit"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
@@ -434,6 +439,10 @@ type Config struct {
 	// Defaults to no timeout (wait indefinitely for jobs to finish).
 	SoftStopTimeout time.Duration
 
+	// Sequences configures opt-in ordered inserts and independent reconciliation.
+	// Closing acceptance does not stop already committed sequences from draining.
+	Sequences SequenceConfig
+
 	// SkipJobKindValidation causes the job kind format validation check to be
 	// skipped. This is available as an interim stopgap for users that have
 	// invalid job kind names, but would rather disable the check rather than
@@ -568,6 +577,7 @@ func (c *Config) WithDefaults() *Config {
 		RescueStuckJobsAfter:        cmp.Or(c.RescueStuckJobsAfter, rescueAfter),
 		RetryPolicy:                 retryPolicy,
 		Schema:                      c.Schema,
+		Sequences:                   c.Sequences.withDefaults(),
 		SoftStopTimeout:             c.SoftStopTimeout,
 		SkipJobKindValidation:       c.SkipJobKindValidation,
 		SkipUnknownJobCheck:         c.SkipUnknownJobCheck,
@@ -581,6 +591,9 @@ func (c *Config) WithDefaults() *Config {
 }
 
 func (c *Config) validate() error {
+	if err := c.Sequences.validate(); err != nil {
+		return err
+	}
 	if c.CancelledJobRetentionPeriod < -1 {
 		return errors.New("CancelledJobRetentionPeriod time cannot be less than zero, except for -1 (infinite)")
 	}
@@ -770,6 +783,7 @@ type Client[TTx any] struct {
 	queueMaintainer       *maintenance.QueueMaintainer
 	queueMaintainerLeader *maintenance.QueueMaintainerLeader
 	queues                *QueueBundle
+	sequenceService       *sequenceruntime.Service
 	services              []startstop.Service
 	stopped               <-chan struct{}
 	stuckJobCount         atomic.Int32
@@ -953,6 +967,18 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 			return nil, errMissingDatabasePoolWithQueues
 		}
 
+		// Sequence coordination is independent of leader election and completion.
+		// Its operational failures are contained inside its own service loop.
+		if _, ok := driver.GetExecutor().(riverdriver.SequenceExecutor); ok && !config.Sequences.DisableReconciler {
+			client.sequenceService = sequenceruntime.New(archetype, &sequenceruntime.Config{
+				BatchSize:          config.Sequences.BatchSize,
+				PollInterval:       config.Sequences.PollInterval,
+				Schema:             config.Schema,
+				TransactionTimeout: config.Sequences.TransactionTimeout,
+			}, driver.GetExecutor())
+			client.services = append(client.services, client.sequenceService)
+		}
+
 		client.completer = jobcompleter.NewBatchCompleter(archetype, config.Schema, driver.GetExecutor(), client.pilot, nil)
 		client.subscriptionManager = newSubscriptionManager(archetype, nil)
 		client.services = append(client.services, client.completer, client.subscriptionManager)
@@ -1044,8 +1070,13 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 				AdvisoryLockPrefix: config.AdvisoryLockPrefix,
 				PluginLookupGlobal: client.pluginLookupGlobal,
 				Insert:             client.insertMany,
-				Pilot:              client.pilot,
-				Schema:             config.Schema,
+				IsolateJob: func(params *rivertype.JobInsertParams) bool {
+					_, ordered := params.Args.(JobArgsWithSequenceOpts)
+					return ordered
+				},
+				IsolatedInsertTimeout: config.Sequences.TransactionTimeout,
+				Pilot:                 client.pilot,
+				Schema:                config.Schema,
 			}, driver.GetExecutor())
 			if err != nil {
 				return nil, err
@@ -1646,9 +1677,31 @@ func (c *Client[TTx]) JobGetTx(ctx context.Context, tx TTx, id int64) (*rivertyp
 // current time only if it's not already in the past.
 //
 // MaxAttempts is also incremented by one if the job has already exhausted its
-// max attempts.
+// max attempts. Sequence members can only be retried while they are the current
+// unresolved head; retrying a successor or a resolved member returns an error.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow, error) {
-	return c.jobRetry(ctx, c.driver.GetExecutor(), id)
+	if !c.driver.PoolIsSet() {
+		return nil, errNoDriverDBPool
+	}
+	job, err := c.JobGet(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if job.SequenceKey == nil {
+		return c.jobRetry(ctx, c.driver.GetExecutor(), id)
+	}
+	var retried *rivertype.JobRow
+	err = c.sequenceWithTx(ctx, func(ctx context.Context, tx riverdriver.ExecutorTx) error {
+		var err error
+		retried, err = sequenceruntime.Retry(ctx, tx, &riverdriver.JobRetryParams{
+			ID: id, Now: c.baseService.Time.NowOrNil(), Schema: c.config.Schema,
+		})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return retried, nil
 }
 
 // JobRetryTx updates the job with the given ID to make it immediately available
@@ -1663,9 +1716,20 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id int64) (*rivertype.JobRow
 // it's not already in the past.
 //
 // MaxAttempts is also incremented by one if the job has already exhausted its
-// max attempts.
+// max attempts. Sequence members can only be retried while they are the current
+// unresolved head; retrying a successor or a resolved member returns an error.
 func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id int64) (*rivertype.JobRow, error) {
-	return c.jobRetry(ctx, c.driver.UnwrapExecutor(tx), id)
+	execTx := c.driver.UnwrapExecutor(tx)
+	job, err := execTx.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: id, Schema: c.config.Schema})
+	if err != nil {
+		return nil, err
+	}
+	if job.SequenceKey == nil {
+		return c.jobRetry(ctx, execTx, id)
+	}
+	return sequenceruntime.Retry(ctx, execTx, &riverdriver.JobRetryParams{
+		ID: id, Now: c.baseService.Time.NowOrNil(), Schema: c.config.Schema,
+	})
 }
 
 func (c *Client[TTx]) jobRetry(ctx context.Context, exec riverdriver.Executor, id int64) (*rivertype.JobRow, error) {
@@ -1786,6 +1850,10 @@ func insertParamsFromConfigArgsAndOptions(archetype *baseservice.Archetype, conf
 	var jobInsertOpts InsertOpts
 	if argsWithOpts, ok := args.(JobArgsWithInsertOpts); ok {
 		jobInsertOpts = argsWithOpts.InsertOpts()
+	}
+
+	if _, ok := args.(JobArgsWithSequenceOpts); ok && (insertOpts.Pending || jobInsertOpts.Pending) {
+		return nil, ErrSequencePending
 	}
 
 	// If the time is stubbed (in a test), use that for `created_at`. Otherwise,
@@ -2020,10 +2088,7 @@ func (c *Client[TTx]) validateParamsAndInsertMany(ctx context.Context, execTx ri
 // by the PeriodicJobEnqueuer.
 func (c *Client[TTx]) insertMany(ctx context.Context, execTx riverdriver.ExecutorTx, insertParams []*rivertype.JobInsertParams) ([]*rivertype.JobInsertResult, error) {
 	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
-		results, err := c.pilot.JobInsertMany(ctx, execTx, &riverdriver.JobInsertFastManyParams{
-			Jobs:   insertParams,
-			Schema: c.config.Schema,
-		})
+		results, err := c.insertManyWithSequences(ctx, execTx, insertParams)
 		if err != nil {
 			return nil, err
 		}
@@ -2251,6 +2316,12 @@ func (c *Client[TTx]) insertManyFast(ctx context.Context, execTx riverdriver.Exe
 	}
 
 	return c.insertManyShared(ctx, execTx, insertParams, func(ctx context.Context, insertParams []*riverdriver.JobInsertFastParams) ([]*rivertype.JobInsertResult, error) {
+		for _, params := range insertParams {
+			if _, ok := params.Args.(JobArgsWithSequenceOpts); ok {
+				return nil, ErrSequenceFastInsert
+			}
+		}
+
 		count, err := execTx.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
 			Jobs:   insertParams,
 			Schema: c.config.Schema,
@@ -3106,4 +3177,607 @@ func defaultClientIDWithHost(startedAt time.Time, host string) string {
 	const rfc3339Compact = "2006_01_02T15_04_05.000000"
 
 	return host + "_" + strings.Replace(startedAt.Format(rfc3339Compact), ".", "_", 1)
+}
+
+var (
+	// ErrSequenceAlreadyResolved requires inserting a new tail job instead of retrying history.
+	ErrSequenceAlreadyResolved = sequenceruntime.ErrAlreadyResolved
+	// ErrSequenceBlocked indicates that an earlier terminal failure must be acknowledged.
+	ErrSequenceBlocked = sequenceruntime.ErrBlocked
+	// ErrSequenceBypass rejects ordered inserts and retries while a group is draining unordered.
+	ErrSequenceBypass = sequenceruntime.ErrBypass
+	// ErrSequenceDisabled rejects new ordered inserts when acceptance is disabled.
+	ErrSequenceDisabled = errors.New("river: sequence insertion is disabled")
+	// ErrSequenceFastInsert requires using InsertMany for ordered jobs.
+	ErrSequenceFastInsert = errors.New("river: sequence jobs are not supported by InsertManyFast; use InsertMany")
+	// ErrSequenceNeedsRepair indicates inconsistent or missing coordination data.
+	ErrSequenceNeedsRepair = sequenceruntime.ErrNeedsRepair
+	// ErrSequenceNotDrained indicates that bypassed work has not completely finished.
+	ErrSequenceNotDrained = sequenceruntime.ErrNotDrained
+	// ErrSequenceNotHead prevents a successor from bypassing its predecessor on retry.
+	ErrSequenceNotHead = sequenceruntime.ErrNotHead
+	// ErrSequenceNotSupported indicates that the driver does not support ordered jobs.
+	ErrSequenceNotSupported = sequenceruntime.ErrNotSupported
+	// ErrSequencePending rejects a separate manual pending requirement on an ordered job.
+	ErrSequencePending = errors.New("river: sequence jobs cannot use InsertOpts.Pending")
+	// ErrSequencePositionExhausted indicates that the durable position allocator cannot advance.
+	ErrSequencePositionExhausted = sequenceruntime.ErrPositionExhausted
+	// ErrSequenceStateConflict indicates that an administrator's expected barrier is stale.
+	ErrSequenceStateConflict = sequenceruntime.ErrStateConflict
+)
+
+// JobArgsWithSequenceOpts opts a job into durable, ordered execution. New jobs
+// enter pending, including the head and jobs scheduled for the future. Only the
+// independent reconciler releases them into River's ordinary job lifecycle.
+// Workers still require idempotency because River provides at-least-once execution.
+type JobArgsWithSequenceOpts interface {
+	JobArgs
+	SequenceOpts() SequenceOpts
+}
+
+// SequenceActionOpts identifies an explicit administrative ordering decision.
+// Reason is required and is recorded in structured application logs. Applications
+// requiring permanent audit history should also use their own audit system.
+type SequenceActionOpts struct {
+	Reason    string
+	RequestID string
+}
+
+// SequenceConfig controls ordered inserts independently of existing work.
+type SequenceConfig struct {
+	// AcceptNewJobs enables inserts implementing JobArgsWithSequenceOpts.
+	// Defaults to false. Turning it off does not stop reconciliation.
+	AcceptNewJobs bool
+	// BatchSize bounds the groups examined on each pass. Defaults to 32.
+	BatchSize int
+	// DisableReconciler explicitly disables the background service on this
+	// client. Use only when another executing client reconciles committed work
+	// or while performing the documented offline recovery procedure.
+	DisableReconciler bool
+	// PollInterval is the delay between bounded passes. Defaults to one second.
+	PollInterval time.Duration
+	// TransactionTimeout bounds independent reconciliation, administrative,
+	// and sequence periodic-insert transactions. It does not override
+	// caller-owned business transactions. Defaults to two seconds.
+	TransactionTimeout time.Duration
+}
+
+// withDefaults copies configuration and fills bounded background service defaults.
+func (c SequenceConfig) withDefaults() SequenceConfig {
+	if c.BatchSize == 0 {
+		c.BatchSize = 32
+	}
+	if c.PollInterval == 0 {
+		c.PollInterval = time.Second
+	}
+	if c.TransactionTimeout == 0 {
+		c.TransactionTimeout = 2 * time.Second
+	}
+	return c
+}
+
+// validate rejects values that could make coordination unbounded or excessively busy.
+func (c SequenceConfig) validate() error {
+	if c.BatchSize < 1 || c.BatchSize > 256 {
+		return errors.New("Sequences.BatchSize must be between 1 and 256")
+	}
+	if c.PollInterval < 10*time.Millisecond || c.PollInterval > time.Minute {
+		return errors.New("Sequences.PollInterval must be between 10ms and 1m")
+	}
+	if c.TransactionTimeout < 100*time.Millisecond || c.TransactionTimeout > 10*time.Second {
+		return errors.New("Sequences.TransactionTimeout must be between 100ms and 10s")
+	}
+	return nil
+}
+
+// SequenceGroup contains persistent allocation and stop-policy information.
+type SequenceGroup = riverdriver.SequenceGroup
+
+// SequenceInfo is an operational snapshot. Concurrent job transitions may change
+// its head or counts immediately after it is read; management operations always
+// lock and revalidate the actual rows before changing them.
+type SequenceInfo struct {
+	*SequenceGroup
+
+	ActiveCount      int64
+	Head             *rivertype.JobRow
+	NonterminalCount int64
+	UnresolvedCount  int64
+}
+
+// SequenceListOpts selects a bounded page ordered by group key.
+type SequenceListOpts struct {
+	AfterKey string
+	// Limit defaults to 100 and must be between 1 and 1000.
+	Limit int
+}
+
+// SequenceOpts defines the grouping key and the current job's terminal policy.
+// Kind participates unless ExcludeKind is set. With ByArgs, fields tagged
+// river:"sequence" select the argument fingerprint; otherwise all encoded args
+// participate. A group with no selected dimension falls back to kind.
+type SequenceOpts struct {
+	ByArgs              bool
+	ByQueue             bool
+	ContinueOnCancelled bool
+	ContinueOnDiscarded bool
+	ExcludeKind         bool
+}
+
+// SequenceReconcileResult describes one bounded reconciliation transaction.
+// A Tx result describes changes that remain subject to the caller's commit.
+type SequenceReconcileResult = sequenceruntime.ReconcileResult
+
+// SequenceStatus reports local coordinator health and committed progress counters.
+type SequenceStatus = sequenceruntime.Status
+
+// SequenceResumeOpts acknowledges exactly the blocked job seen by an operator.
+// The expected ID and position prevent a stale request from skipping a different
+// failure. Reason is required and emitted in structured logs.
+type SequenceResumeOpts struct {
+	ExpectedJobID    int64
+	ExpectedPosition int64
+	Reason           string
+	RequestID        string
+}
+
+// SequenceBypass explicitly waives ordering while preserving every job and its
+// normal execution/retry state. The reconciler drains pending members in bounded
+// batches. New ordered inserts are rejected until SequenceRestore succeeds.
+func (c *Client[TTx]) SequenceBypass(ctx context.Context, key string, opts *SequenceActionOpts) error {
+	return c.sequenceAction(ctx, key, opts, "bypass", sequenceruntime.Bypass)
+}
+
+// SequenceBypassTx changes bypass mode within the caller-owned transaction.
+func (c *Client[TTx]) SequenceBypassTx(ctx context.Context, tx TTx, key string, opts *SequenceActionOpts) error {
+	return c.sequenceActionTx(ctx, c.driver.UnwrapExecutor(tx), key, opts, "bypass", sequenceruntime.Bypass)
+}
+
+// SequenceGet returns a bounded operational snapshot of a sequence group.
+func (c *Client[TTx]) SequenceGet(ctx context.Context, key string) (*SequenceInfo, error) {
+	if !c.driver.PoolIsSet() {
+		return nil, errNoDriverDBPool
+	}
+	return c.sequenceGet(ctx, c.driver.GetExecutor(), key)
+}
+
+// SequenceGetTx reads a snapshot using the caller-owned transaction.
+func (c *Client[TTx]) SequenceGetTx(ctx context.Context, tx TTx, key string) (*SequenceInfo, error) {
+	return c.sequenceGet(ctx, c.driver.UnwrapExecutor(tx), key)
+}
+
+// SequenceList returns groups in key order. Pass the last key as AfterKey to
+// continue pagination; each snapshot includes its current head and counts.
+func (c *Client[TTx]) SequenceList(ctx context.Context, opts *SequenceListOpts) ([]*SequenceInfo, error) {
+	if !c.driver.PoolIsSet() {
+		return nil, errNoDriverDBPool
+	}
+	return c.sequenceList(ctx, c.driver.GetExecutor(), opts)
+}
+
+// SequenceListTx reads groups using the caller-owned transaction.
+func (c *Client[TTx]) SequenceListTx(ctx context.Context, tx TTx, opts *SequenceListOpts) ([]*SequenceInfo, error) {
+	return c.sequenceList(ctx, c.driver.UnwrapExecutor(tx), opts)
+}
+
+// SequenceReconcile performs one bounded group check in an independent
+// transaction. It never changes the outcome of already completed work.
+func (c *Client[TTx]) SequenceReconcile(ctx context.Context, key string) (*SequenceReconcileResult, error) {
+	if !c.driver.PoolIsSet() {
+		return nil, errNoDriverDBPool
+	}
+	if err := validateSequenceKey(key); err != nil {
+		return nil, err
+	}
+	var result *SequenceReconcileResult
+	err := c.sequenceWithTx(ctx, func(ctx context.Context, tx riverdriver.ExecutorTx) error {
+		var err error
+		result, err = sequenceruntime.Reconcile(ctx, tx, c.config.Schema, key)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// SequenceReconcileTx performs one check without committing the caller's transaction.
+func (c *Client[TTx]) SequenceReconcileTx(ctx context.Context, tx TTx, key string) (*SequenceReconcileResult, error) {
+	if err := validateSequenceKey(key); err != nil {
+		return nil, err
+	}
+	return sequenceruntime.Reconcile(ctx, c.driver.UnwrapExecutor(tx), c.config.Schema, key)
+}
+
+// SequenceRestore re-enables ordered inserts only after all members, including
+// previously bypassed members, are terminal and their ordering is resolved.
+func (c *Client[TTx]) SequenceRestore(ctx context.Context, key string, opts *SequenceActionOpts) error {
+	return c.sequenceAction(ctx, key, opts, "restore", sequenceruntime.Restore)
+}
+
+// SequenceRestoreTx restores ordering within the caller-owned transaction.
+func (c *Client[TTx]) SequenceRestoreTx(ctx context.Context, tx TTx, key string, opts *SequenceActionOpts) error {
+	return c.sequenceActionTx(ctx, c.driver.UnwrapExecutor(tx), key, opts, "restore", sequenceruntime.Restore)
+}
+
+// SequenceResume acknowledges a cancelled or discarded barrier and resolves it
+// atomically. It does not change the job's terminal outcome. An explicitly
+// deleted barrier may also be acknowledged using its stored ID and position.
+func (c *Client[TTx]) SequenceResume(ctx context.Context, key string, opts *SequenceResumeOpts) error {
+	if !c.driver.PoolIsSet() {
+		return errNoDriverDBPool
+	}
+	return c.sequenceWithTx(ctx, func(ctx context.Context, tx riverdriver.ExecutorTx) error {
+		return c.sequenceResume(ctx, tx, key, opts)
+	})
+}
+
+// SequenceResumeTx acknowledges the expected barrier in the caller's transaction.
+func (c *Client[TTx]) SequenceResumeTx(ctx context.Context, tx TTx, key string, opts *SequenceResumeOpts) error {
+	return c.sequenceResume(ctx, c.driver.UnwrapExecutor(tx), key, opts)
+}
+
+// SequenceStatus returns local background coordinator health, or nil for an
+// insert-only client, an unsupported driver, or an explicitly disabled service.
+func (c *Client[TTx]) SequenceStatus() *SequenceStatus {
+	if c.sequenceService == nil {
+		return nil
+	}
+	status := c.sequenceService.Status()
+	return &status
+}
+
+// attachSequenceInsert attaches only new jobs; unique matches retain their original identity.
+func (c *Client[TTx]) attachSequenceInsert(ctx context.Context, tx riverdriver.ExecutorTx, entries []*sequenceInsertEntry, results []*riverdriver.JobInsertFastResult) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if len(entries) != len(results) {
+		return errors.New("river: sequence insert result count differs from input")
+	}
+	attachments := make([]sequenceruntime.Attachment, 0, len(entries))
+	resultIndexes := make([]int, 0, len(entries))
+	for i, entry := range entries {
+		if entry == nil || results[i].UniqueSkippedAsDuplicate {
+			continue
+		}
+		attachments = append(attachments, sequenceruntime.Attachment{
+			ContinueOnCancelled: entry.opts.ContinueOnCancelled,
+			ContinueOnDiscarded: entry.opts.ContinueOnDiscarded,
+			JobID:               results[i].Job.ID,
+			Key:                 entry.key,
+		})
+		resultIndexes = append(resultIndexes, i)
+	}
+	jobs, err := sequenceruntime.Attach(ctx, tx, c.config.Schema, attachments)
+	if err != nil {
+		return err
+	}
+	if len(jobs) != len(attachments) {
+		return errors.New("river: sequence attach result count differs from input")
+	}
+	for i, job := range jobs {
+		results[resultIndexes[i]].Job = job
+	}
+	return nil
+}
+
+// insertManyWithSequences uses an explicit savepoint only for ordered batches.
+// A post-insert Go error must not leave an unattached pending job if a caller
+// commits its surrounding business transaction after handling that error.
+func (c *Client[TTx]) insertManyWithSequences(ctx context.Context, tx riverdriver.ExecutorTx, params []*riverdriver.JobInsertFastParams) ([]*riverdriver.JobInsertFastResult, error) {
+	ordered := false
+	for _, param := range params {
+		if _, ok := param.Args.(JobArgsWithSequenceOpts); ok {
+			ordered = true
+			break
+		}
+	}
+	if !ordered {
+		return c.pilot.JobInsertMany(ctx, tx, &riverdriver.JobInsertFastManyParams{Jobs: params, Schema: c.config.Schema})
+	}
+	if _, ok := tx.(riverdriver.SequenceExecutor); !ok {
+		return nil, ErrSequenceNotSupported
+	}
+	savepoint, err := tx.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("river: begin sequence insert savepoint: %w", err)
+	}
+	defer dbutil.RollbackWithoutCancel(ctx, savepoint)
+	entries, err := c.prepareSequenceInsert(ctx, savepoint, params)
+	if err != nil {
+		return nil, rollbackSequenceInsert(ctx, savepoint, err)
+	}
+	results, err := c.pilot.JobInsertMany(ctx, savepoint, &riverdriver.JobInsertFastManyParams{Jobs: params, Schema: c.config.Schema})
+	if err != nil {
+		return nil, rollbackSequenceInsert(ctx, savepoint, err)
+	}
+	if err := c.attachSequenceInsert(ctx, savepoint, entries, results); err != nil {
+		return nil, rollbackSequenceInsert(ctx, savepoint, err)
+	}
+	if err := savepoint.Commit(ctx); err != nil {
+		return nil, rollbackSequenceInsert(ctx, savepoint, err)
+	}
+	return results, nil
+}
+
+// rollbackSequenceInsert makes error atomicity independent of the outer owner.
+func rollbackSequenceInsert(ctx context.Context, tx riverdriver.ExecutorTx, originalErr error) error {
+	if err := dbutil.RollbackWithoutCancel(ctx, tx); err != nil {
+		return errors.Join(originalErr, fmt.Errorf("river: rollback sequence insert savepoint: %w", err))
+	}
+	return originalErr
+}
+
+// prepareSequenceInsert runs after all insert hooks, using their final queue and args.
+func (c *Client[TTx]) prepareSequenceInsert(ctx context.Context, tx riverdriver.ExecutorTx, params []*riverdriver.JobInsertFastParams) ([]*sequenceInsertEntry, error) {
+	var entries []*sequenceInsertEntry
+	var keys []string
+	for i, param := range params {
+		args, ok := param.Args.(JobArgsWithSequenceOpts)
+		if !ok {
+			continue
+		}
+		if _, supported := tx.(riverdriver.SequenceExecutor); !supported {
+			return nil, ErrSequenceNotSupported
+		}
+		if !c.config.Sequences.AcceptNewJobs {
+			return nil, ErrSequenceDisabled
+		}
+		if param.State == rivertype.JobStatePending {
+			return nil, ErrSequencePending
+		}
+		opts := args.SequenceOpts()
+		finalArgs, err := sequenceFinalArgs(args, param.EncodedArgs)
+		if err != nil {
+			return nil, err
+		}
+		key, err := sequenceKey(param.Queue, param.Kind, param.EncodedArgs, opts, finalArgs)
+		if err != nil {
+			return nil, err
+		}
+		if entries == nil {
+			entries = make([]*sequenceInsertEntry, len(params))
+		}
+		entries[i] = &sequenceInsertEntry{key: key, opts: opts}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	if err := sequenceruntime.Prepare(ctx, tx, c.config.Schema, keys); err != nil {
+		return nil, err
+	}
+	for i, entry := range entries {
+		if entry != nil {
+			params[i].State = rivertype.JobStatePending
+		}
+	}
+	return entries, nil
+}
+
+// sequenceAction runs a reasoned administrative operation in an owned transaction.
+func (c *Client[TTx]) sequenceAction(ctx context.Context, key string, opts *SequenceActionOpts, action string, perform func(context.Context, riverdriver.ExecutorTx, string, string) error) error {
+	if !c.driver.PoolIsSet() {
+		return errNoDriverDBPool
+	}
+	return c.sequenceWithTx(ctx, func(ctx context.Context, tx riverdriver.ExecutorTx) error {
+		return c.sequenceActionTx(ctx, tx, key, opts, action, perform)
+	})
+}
+
+// sequenceActionTx logs successful transaction-local administrative changes.
+func (c *Client[TTx]) sequenceActionTx(ctx context.Context, tx riverdriver.ExecutorTx, key string, opts *SequenceActionOpts, action string, perform func(context.Context, riverdriver.ExecutorTx, string, string) error) error {
+	if err := validateSequenceKey(key); err != nil {
+		return err
+	}
+	if opts == nil || strings.TrimSpace(opts.Reason) == "" {
+		return errors.New("river: sequence administrative action requires a reason")
+	}
+	if err := perform(ctx, tx, c.config.Schema, key); err != nil {
+		return err
+	}
+	c.baseService.Logger.WarnContext(ctx, "River sequence administrative change (subject to transaction commit)",
+		"schema", c.config.Schema, "key", key, "action", action, "reason", opts.Reason, "request_id", opts.RequestID)
+	return nil
+}
+
+// sequenceGet reads a group without taking execution or coordination locks.
+func (c *Client[TTx]) sequenceGet(ctx context.Context, exec riverdriver.Executor, key string) (*SequenceInfo, error) {
+	if err := validateSequenceKey(key); err != nil {
+		return nil, err
+	}
+	sequenceExec, ok := exec.(riverdriver.SequenceExecutor)
+	if !ok {
+		return nil, ErrSequenceNotSupported
+	}
+	group, err := sequenceExec.SequenceGroupGet(ctx, &riverdriver.SequenceGroupGetParams{Key: key, Schema: c.config.Schema})
+	if err != nil {
+		return nil, err
+	}
+	return c.sequenceInfo(ctx, sequenceExec, group)
+}
+
+// sequenceInfo combines independent diagnostic reads; mutation paths never trust this snapshot.
+func (c *Client[TTx]) sequenceInfo(ctx context.Context, exec riverdriver.SequenceExecutor, group *riverdriver.SequenceGroup) (*SequenceInfo, error) {
+	params := &riverdriver.SequenceGroupKeyParams{Key: group.Key, Schema: c.config.Schema}
+	stats, err := exec.SequenceJobStats(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	head, err := exec.SequenceJobHead(ctx, params)
+	if err != nil && !errors.Is(err, rivertype.ErrNotFound) {
+		return nil, err
+	}
+	return &SequenceInfo{
+		SequenceGroup:    group,
+		ActiveCount:      stats.Active,
+		Head:             head,
+		NonterminalCount: stats.Nonterminal,
+		UnresolvedCount:  stats.Unresolved,
+	}, nil
+}
+
+// sequenceList enumerates bounded pages so administration cannot scan the entire table accidentally.
+func (c *Client[TTx]) sequenceList(ctx context.Context, exec riverdriver.Executor, opts *SequenceListOpts) ([]*SequenceInfo, error) {
+	sequenceExec, ok := exec.(riverdriver.SequenceExecutor)
+	if !ok {
+		return nil, ErrSequenceNotSupported
+	}
+	if opts == nil {
+		opts = &SequenceListOpts{}
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = 100
+	}
+	if limit < 1 || limit > 1000 {
+		return nil, errors.New("river: sequence list limit must be between 1 and 1000")
+	}
+	groups, err := sequenceExec.SequenceGroupList(ctx, &riverdriver.SequenceGroupListParams{AfterKey: opts.AfterKey, Limit: limit, Schema: c.config.Schema})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*SequenceInfo, 0, len(groups))
+	for _, group := range groups {
+		info, err := c.sequenceInfo(ctx, sequenceExec, group)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, info)
+	}
+	return result, nil
+}
+
+// sequenceResume validates the exact acknowledgement before the runtime takes locks.
+func (c *Client[TTx]) sequenceResume(ctx context.Context, tx riverdriver.ExecutorTx, key string, opts *SequenceResumeOpts) error {
+	if err := validateSequenceKey(key); err != nil {
+		return err
+	}
+	if opts == nil || opts.ExpectedJobID <= 0 || opts.ExpectedPosition <= 0 || strings.TrimSpace(opts.Reason) == "" {
+		return errors.New("river: sequence resume requires expected job ID, position, and a reason")
+	}
+	if err := sequenceruntime.Resume(ctx, tx, c.config.Schema, key, opts.ExpectedJobID, opts.ExpectedPosition); err != nil {
+		return err
+	}
+	c.baseService.Logger.WarnContext(ctx, "River sequence administrative change (subject to transaction commit)",
+		"schema", c.config.Schema, "key", key, "action", "resume", "job_id", opts.ExpectedJobID,
+		"position", opts.ExpectedPosition, "reason", opts.Reason, "request_id", opts.RequestID)
+	return nil
+}
+
+// sequenceWithTx bounds only transactions created by non-Tx sequence methods.
+// Caller-owned Tx methods deliberately never change isolation or timeout settings.
+func (c *Client[TTx]) sequenceWithTx(ctx context.Context, perform func(context.Context, riverdriver.ExecutorTx) error) error {
+	ctx, cancel := context.WithTimeout(ctx, c.config.Sequences.TransactionTimeout)
+	defer cancel()
+	return dbutil.WithTx(ctx, c.driver.GetExecutor(), func(ctx context.Context, tx riverdriver.ExecutorTx) error {
+		exec, ok := tx.(riverdriver.SequenceExecutor)
+		if !ok {
+			return ErrSequenceNotSupported
+		}
+		if err := exec.SequenceSetLocalTimeouts(ctx); err != nil {
+			return err
+		}
+		return perform(ctx, tx)
+	})
+}
+
+// sequenceInsertEntry holds prepared sequence identity until newly inserted rows can be attached.
+type sequenceInsertEntry struct {
+	key  string
+	opts SequenceOpts
+}
+
+// sequenceFinalArgs preserves reference encoding for ordinary inserts while
+// deriving tagged fields from the actual stored payload when a hook changes it.
+func sequenceFinalArgs(args any, encodedArgs []byte) (any, error) {
+	original, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("river: marshaling final sequence args: %w", err)
+	}
+	if bytes.Equal(original, encodedArgs) {
+		return args, nil
+	}
+	argType := reflect.TypeOf(args)
+	if argType == nil {
+		return nil, errors.New("river: sequence args are nil")
+	}
+	if argType.Kind() == reflect.Pointer {
+		argType = argType.Elem()
+	}
+	decoded := reflect.New(argType)
+	if err := json.Unmarshal(encodedArgs, decoded.Interface()); err != nil {
+		return nil, fmt.Errorf("river: decoding final sequence args: %w", err)
+	}
+	return decoded.Interface(), nil
+}
+
+// sequenceKey implements the stable v1 grouping protocol for ordered jobs.
+func sequenceKey(queue, kind string, encodedArgs []byte, opts SequenceOpts, args any) (string, error) {
+	parts := make([]string, 0, 3)
+	if opts.ByQueue {
+		parts = append(parts, "queue="+queue)
+	}
+	if !opts.ExcludeKind {
+		parts = append(parts, "kind="+kind)
+	}
+	if opts.ByArgs {
+		fingerprint := encodedArgs
+		if selected := sequenceTaggedFields(args); len(selected) > 0 {
+			var err error
+			fingerprint, err = json.Marshal(selected)
+			if err != nil {
+				return "", fmt.Errorf("river: marshaling sequence fields: %w", err)
+			}
+		}
+		parts = append(parts, "args="+string(fingerprint))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "kind="+kind)
+	}
+	hash := sha256.New()
+	for _, part := range parts {
+		_, _ = hash.Write([]byte(part))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// sequenceTaggedFields preserves the reference's top-level field and tag semantics.
+func sequenceTaggedFields(args any) map[string]any {
+	selected := make(map[string]any)
+	value := reflect.ValueOf(args)
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return selected
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return selected
+	}
+	for i := range value.NumField() {
+		field := value.Type().Field(i)
+		if field.PkgPath != "" || !strings.Contains(field.Tag.Get("river"), "sequence") {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		selected[name] = value.Field(i).Interface()
+	}
+	return selected
+}
+
+// validateSequenceKey protects management calls from accidental unbounded or empty scopes.
+func validateSequenceKey(key string) error {
+	if len(key) == 0 || len(key) >= 512 {
+		return errors.New("river: sequence key must contain between 1 and 511 bytes")
+	}
+	return nil
 }
