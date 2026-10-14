@@ -65,21 +65,28 @@ func JobCompleteTx[TDriver riverdriver.Driver[TTx], TTx any, TArgs JobArgs](ctx 
 
 	execTx := driver.UnwrapExecutor(tx)
 	params := riverdriver.JobSetStateCompleted(job.ID, client.baseService.Time.Now(), nil)
+	params.SetExpectedClaim(job.JobRow)
 	rows, err := pilot.JobSetStateIfRunningMany(ctx, execTx, &riverdriver.JobSetStateIfRunningManyParams{
-		ID:              []int64{params.ID},
-		Attempt:         []*int{params.Attempt},
-		ErrData:         [][]byte{params.ErrData},
-		FinalizedAt:     []*time.Time{params.FinalizedAt},
-		MetadataDoMerge: []bool{hasMetadataUpdates},
-		MetadataUpdates: [][]byte{metadataUpdatesBytes},
-		ScheduledAt:     []*time.Time{params.ScheduledAt},
-		Schema:          client.config.Schema,
-		State:           []rivertype.JobState{params.State},
+		ID:                  []int64{params.ID},
+		Attempt:             []*int{params.Attempt},
+		ErrData:             [][]byte{params.ErrData},
+		ExpectedAttempt:     []*int{params.ExpectedAttempt},
+		ExpectedAttemptedAt: []*time.Time{params.ExpectedAttemptedAt},
+		FinalizedAt:         []*time.Time{params.FinalizedAt},
+		MetadataDoMerge:     []bool{hasMetadataUpdates},
+		MetadataUpdates:     [][]byte{metadataUpdatesBytes},
+		ScheduledAt:         []*time.Time{params.ScheduledAt},
+		Schema:              client.config.Schema,
+		State:               []rivertype.JobState{params.State},
 	})
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
+		if guard := joblease.FromContext(ctx); guard != nil {
+			guard.Abandon()
+			return nil, ErrJobLeaseLost
+		}
 		if _, isInsideTestWorker := ctx.Value(execution.ContextKeyInsideTestWorker{}).(bool); isInsideTestWorker {
 			panic("to use JobCompleteTx in a rivertest.Worker, the job must be inserted into the database first")
 		}

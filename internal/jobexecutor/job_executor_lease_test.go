@@ -9,12 +9,30 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/riverqueue/river/internal/jobcompleter"
 	"github.com/riverqueue/river/internal/joblease"
+	"github.com/riverqueue/river/internal/jobstats"
 	"github.com/riverqueue/river/internal/pluginlookup"
+	"github.com/riverqueue/river/internal/rivercommon"
+	"github.com/riverqueue/river/internal/riverinternaltest/retrypolicytest"
+	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/riverqueue/river/rivertype"
 )
+
+// leaseResultCompleter records the execution result admitted by the executor.
+type leaseResultCompleter struct {
+	jobcompleter.JobCompleter
+
+	params *riverdriver.JobSetStateIfRunningParams
+}
+
+// JobSetStateIfRunning captures the claim conditions attached to the result.
+func (c *leaseResultCompleter) JobSetStateIfRunning(_ context.Context, _ *jobstats.JobStatistics, params *riverdriver.JobSetStateIfRunningParams) error {
+	c.params = params
+	return nil
+}
 
 func TestJobExecutor_LeaseAbandoned(t *testing.T) {
 	t.Parallel()
@@ -49,6 +67,58 @@ func TestJobExecutor_LeaseAbandoned(t *testing.T) {
 
 			require.True(t, jobDone)
 			require.ErrorIs(t, context.Cause(ctx), rivertype.ErrJobLeaseLost)
+		})
+	}
+}
+
+// TestJobExecutor_LeaseClaimOnResults covers every execution-result path,
+// including transitions that refund Attempt while preserving ExpectedAttempt.
+func TestJobExecutor_LeaseClaimOnResults(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		result   func() error
+		softStop bool
+		state    rivertype.JobState
+	}{
+		{name: "Cancel", result: func() error { return rivertype.JobCancel(errors.New("cancel")) }, state: rivertype.JobStateCancelled},
+		{name: "Error", result: func() error { return errors.New("failed") }, state: rivertype.JobStateRetryable},
+		{name: "Panic", result: func() error { panic("failed") }, state: rivertype.JobStateRetryable},
+		{name: "Snooze", result: func() error { return &rivertype.JobSnoozeError{Duration: time.Hour} }, state: rivertype.JobStateScheduled},
+		{name: "SoftStop", result: func() error { return context.Canceled }, softStop: true, state: rivertype.JobStateAvailable},
+		{name: "Success", result: func() error { return nil }, state: rivertype.JobStateCompleted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			guard := joblease.NewGuard(time.Now().Add(time.Minute), cancel)
+			defer guard.Abandon()
+			executor := newLeaseTestExecutor(t, cancel, func() error {
+				if test.softStop {
+					cancel(rivercommon.ErrStop)
+				}
+				return test.result()
+			})
+			executor.ClientRetryPolicy = &retrypolicytest.RetryPolicyNoJitter{}
+			executor.JobRow.Attempt = 3
+			executor.JobRow.AttemptedAt = new(time.Now())
+			executor.JobRow.LeaseExpiresAt = new(time.Now().Add(time.Minute))
+			executor.JobRow.MaxAttempts = 10
+			completer := &leaseResultCompleter{}
+			executor.Completer = completer
+
+			executor.Execute(joblease.WithGuard(ctx, guard))
+
+			require.NotNil(t, completer.params)
+			require.Equal(t, test.state, completer.params.State)
+			require.Equal(t, 3, *completer.params.ExpectedAttempt)
+			require.Equal(t, executor.JobRow.AttemptedAt, completer.params.ExpectedAttemptedAt)
+			if test.name == "Snooze" || test.softStop {
+				require.Equal(t, 2, *completer.params.Attempt)
+			}
 		})
 	}
 }

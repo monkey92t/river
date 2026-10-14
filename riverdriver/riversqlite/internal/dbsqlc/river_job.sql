@@ -747,11 +747,17 @@ RETURNING
 -- to tolerate values that aren't valid JSON. See JobGetAvailable.
 -- name: JobSetMetadataIfNotRunning :one
 UPDATE /* TEMPLATE: schema */river_job
-SET metadata = CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata)
+SET metadata = CASE WHEN NOT cast(@expected_claim_do_check AS boolean) AND (typeof(metadata) <> 'text' OR json_valid(metadata))
                     THEN jsonb_patch(json(metadata), json(@metadata_updates))
                     ELSE metadata END
 WHERE id = @id
     AND state != 'running'
+    AND (
+        (NOT cast(@expected_claim_do_check AS boolean) AND lease_expires_at IS NULL)
+        OR (cast(@expected_claim_do_check AS boolean)
+            AND attempted_at = cast(@expected_attempted_at AS text)
+            AND attempt = CASE WHEN cast(@attempt_do_update AS boolean) AND state = @state THEN @attempt ELSE @expected_attempt END)
+    )
 RETURNING
     id,
     cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
@@ -817,6 +823,13 @@ SET
                         ELSE @state END
 WHERE id = @id
     AND state = 'running'
+    AND (
+        (NOT cast(@expected_claim_do_check AS boolean) AND lease_expires_at IS NULL)
+        OR (cast(@expected_claim_do_check AS boolean)
+            AND attempt = @expected_attempt
+            AND attempted_at = cast(@expected_attempted_at AS text)
+            AND lease_expires_at > datetime('now', 'subsec'))
+    )
 RETURNING
     id,
     cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,

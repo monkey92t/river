@@ -1951,11 +1951,17 @@ func (q *Queries) JobScheduleSetDiscarded(ctx context.Context, db DBTX, arg *Job
 
 const jobSetMetadataIfNotRunning = `-- name: JobSetMetadataIfNotRunning :one
 UPDATE /* TEMPLATE: schema */river_job
-SET metadata = CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata)
-                    THEN jsonb_patch(json(metadata), json(?1))
+SET metadata = CASE WHEN NOT cast(?1 AS boolean) AND (typeof(metadata) <> 'text' OR json_valid(metadata))
+                    THEN jsonb_patch(json(metadata), json(?2))
                     ELSE metadata END
-WHERE id = ?2
+WHERE id = ?3
     AND state != 'running'
+    AND (
+        (NOT cast(?1 AS boolean) AND lease_expires_at IS NULL)
+        OR (cast(?1 AS boolean)
+            AND attempted_at = cast(?4 AS text)
+            AND attempt = CASE WHEN cast(?5 AS boolean) AND state = ?6 THEN ?7 ELSE ?8 END)
+    )
 RETURNING
     id,
     cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
@@ -1979,8 +1985,14 @@ RETURNING
 `
 
 type JobSetMetadataIfNotRunningParams struct {
-	MetadataUpdates interface{}
-	ID              int64
+	ExpectedClaimDoCheck bool
+	MetadataUpdates      interface{}
+	ID                   int64
+	ExpectedAttemptedAt  string
+	AttemptDoUpdate      bool
+	State                string
+	Attempt              int64
+	ExpectedAttempt      int64
 }
 
 type JobSetMetadataIfNotRunningRow struct {
@@ -2010,7 +2022,16 @@ type JobSetMetadataIfNotRunningRow struct {
 // Metadata that isn't valid JSON is left in place, and columns are listed out
 // to tolerate values that aren't valid JSON. See JobGetAvailable.
 func (q *Queries) JobSetMetadataIfNotRunning(ctx context.Context, db DBTX, arg *JobSetMetadataIfNotRunningParams) (*JobSetMetadataIfNotRunningRow, error) {
-	row := db.QueryRowContext(ctx, jobSetMetadataIfNotRunning, arg.MetadataUpdates, arg.ID)
+	row := db.QueryRowContext(ctx, jobSetMetadataIfNotRunning,
+		arg.ExpectedClaimDoCheck,
+		arg.MetadataUpdates,
+		arg.ID,
+		arg.ExpectedAttemptedAt,
+		arg.AttemptDoUpdate,
+		arg.State,
+		arg.Attempt,
+		arg.ExpectedAttempt,
+	)
 	var i JobSetMetadataIfNotRunningRow
 	err := row.Scan(
 		&i.ID,
@@ -2072,6 +2093,13 @@ SET
                         ELSE ?1 END
 WHERE id = ?13
     AND state = 'running'
+    AND (
+        (NOT cast(?14 AS boolean) AND lease_expires_at IS NULL)
+        OR (cast(?14 AS boolean)
+            AND attempt = ?15
+            AND attempted_at = cast(?16 AS text)
+            AND lease_expires_at > datetime('now', 'subsec'))
+    )
 RETURNING
     id,
     cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
@@ -2095,19 +2123,22 @@ RETURNING
 `
 
 type JobSetStateIfRunningParams struct {
-	State               string
-	AttemptDoUpdate     bool
-	Attempt             int64
-	ErrorsDoUpdate      bool
-	Error               interface{}
-	Now                 *string
-	FinalizedAtDoUpdate bool
-	FinalizedAt         *string
-	MetadataDoMerge     bool
-	MetadataUpdates     interface{}
-	ScheduledAtDoUpdate bool
-	ScheduledAt         string
-	ID                  int64
+	State                string
+	AttemptDoUpdate      bool
+	Attempt              int64
+	ErrorsDoUpdate       bool
+	Error                interface{}
+	Now                  *string
+	FinalizedAtDoUpdate  bool
+	FinalizedAt          *string
+	MetadataDoMerge      bool
+	MetadataUpdates      interface{}
+	ScheduledAtDoUpdate  bool
+	ScheduledAt          string
+	ID                   int64
+	ExpectedClaimDoCheck bool
+	ExpectedAttempt      int64
+	ExpectedAttemptedAt  string
 }
 
 type JobSetStateIfRunningRow struct {
@@ -2155,6 +2186,9 @@ func (q *Queries) JobSetStateIfRunning(ctx context.Context, db DBTX, arg *JobSet
 		arg.ScheduledAtDoUpdate,
 		arg.ScheduledAt,
 		arg.ID,
+		arg.ExpectedClaimDoCheck,
+		arg.ExpectedAttempt,
+		arg.ExpectedAttemptedAt,
 	)
 	var i JobSetStateIfRunningRow
 	err := row.Scan(

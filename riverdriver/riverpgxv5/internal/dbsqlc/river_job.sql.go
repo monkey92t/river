@@ -1675,15 +1675,29 @@ WITH job_input AS (
         unnest($3::int[])                    AS attempt,
         unnest($4::boolean[])       AS errors_do_update,
         unnest($5::jsonb[])                   AS errors,
-        unnest($6::boolean[]) AS finalized_at_do_update,
-        unnest($7::timestamptz[])       AS finalized_at,
-        unnest($8::boolean[])      AS metadata_do_merge,
-        unnest($9::jsonb[])         AS metadata_updates,
-        unnest($10::boolean[]) AS scheduled_at_do_update,
-        unnest($11::timestamptz[])       AS scheduled_at,
+        unnest($6::bigint[])        AS expected_attempt,
+        unnest($7::timestamptz[]) AS expected_attempted_at,
+        unnest($8::boolean[]) AS expected_claim_do_check,
+        unnest($9::boolean[]) AS finalized_at_do_update,
+        unnest($10::timestamptz[])       AS finalized_at,
+        unnest($11::boolean[])      AS metadata_do_merge,
+        unnest($12::jsonb[])         AS metadata_updates,
+        unnest($13::boolean[]) AS scheduled_at_do_update,
+        unnest($14::timestamptz[])       AS scheduled_at,
         -- To avoid requiring pgx users to register the OID of the river_job_state[]
         -- type, we cast the array to text[] and then to river_job_state.
-        unnest($12::text[])::/* TEMPLATE: schema */river_job_state AS state
+        unnest($15::text[])::/* TEMPLATE: schema */river_job_state AS state
+),
+locked_jobs AS (
+    SELECT river_job.id
+    FROM /* TEMPLATE: schema */river_job
+    JOIN job_input ON river_job.id = job_input.id
+    ORDER BY river_job.id
+    FOR UPDATE OF river_job
+),
+locked_batch AS MATERIALIZED (
+    SELECT array_agg(id) AS ids, clock_timestamp() AS checked_at
+    FROM locked_jobs
 ),
 updated AS (
     UPDATE /* TEMPLATE: schema */river_job
@@ -1705,7 +1719,7 @@ updated AS (
         finalized_at = CASE
             WHEN river_job.state = 'running'
                  AND (job_input.state IN ('available','retryable','scheduled') AND river_job.metadata ? 'cancel_attempted_at')
-            THEN coalesce($13::timestamptz, now())
+            THEN coalesce($16::timestamptz, now())
             WHEN river_job.state = 'running'
                  AND job_input.finalized_at_do_update
             THEN job_input.finalized_at
@@ -1731,9 +1745,18 @@ updated AS (
             THEN job_input.state
             ELSE river_job.state
         END
-    FROM job_input
+    FROM job_input, locked_batch
     WHERE river_job.id = job_input.id
+      AND river_job.id = ANY(locked_batch.ids)
       AND (river_job.state = 'running' OR job_input.metadata_do_merge)
+      AND (
+          (NOT job_input.expected_claim_do_check AND river_job.lease_expires_at IS NULL)
+          OR (job_input.expected_claim_do_check
+              AND river_job.state = 'running'
+              AND river_job.attempt = job_input.expected_attempt
+              AND river_job.attempted_at = job_input.expected_attempted_at
+              AND river_job.lease_expires_at > locked_batch.checked_at)
+      )
     RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.lease_expires_at, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
 )
 SELECT river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.lease_expires_at, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
@@ -1744,6 +1767,15 @@ WHERE NOT EXISTS (
     FROM updated
     WHERE updated.id = river_job.id
 )
+AND (
+    (NOT job_input.expected_claim_do_check AND river_job.lease_expires_at IS NULL)
+    OR (job_input.expected_claim_do_check
+        AND river_job.state != 'running'
+        AND river_job.attempted_at = job_input.expected_attempted_at
+        AND river_job.attempt = CASE
+            WHEN job_input.attempt_do_update AND river_job.state = job_input.state THEN job_input.attempt
+            ELSE job_input.expected_attempt END)
+)
 UNION ALL
 SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, lease_expires_at, max_attempts, metadata, priority, queue, state, scheduled_at, tags, sequence_key, sequence_position, sequence_continue_on_cancelled, sequence_continue_on_discarded, sequence_resolved_at, unique_key, unique_states
 FROM updated
@@ -1751,21 +1783,29 @@ ORDER BY id
 `
 
 type JobSetStateIfRunningManyParams struct {
-	IDs                 []int64
-	AttemptDoUpdate     []bool
-	Attempt             []int32
-	ErrorsDoUpdate      []bool
-	Errors              [][]byte
-	FinalizedAtDoUpdate []bool
-	FinalizedAt         []time.Time
-	MetadataDoMerge     []bool
-	MetadataUpdates     [][]byte
-	ScheduledAtDoUpdate []bool
-	ScheduledAt         []time.Time
-	State               []string
-	Now                 *time.Time
+	IDs                  []int64
+	AttemptDoUpdate      []bool
+	Attempt              []int32
+	ErrorsDoUpdate       []bool
+	Errors               [][]byte
+	ExpectedAttempt      []int64
+	ExpectedAttemptedAt  []time.Time
+	ExpectedClaimDoCheck []bool
+	FinalizedAtDoUpdate  []bool
+	FinalizedAt          []time.Time
+	MetadataDoMerge      []bool
+	MetadataUpdates      [][]byte
+	ScheduledAtDoUpdate  []bool
+	ScheduledAt          []time.Time
+	State                []string
+	Now                  *time.Time
 }
 
+// Acquire the row locks before checking lease time. A request that waits for a
+// writer must not complete using an expiry sampled before the lock was granted.
+// Consume every lock before sampling time, including when an earlier row's
+// lease expires while the batch waits for a later row. Materialization also
+// prevents the planner from evaluating the expiry predicate before locking.
 func (q *Queries) JobSetStateIfRunningMany(ctx context.Context, db DBTX, arg *JobSetStateIfRunningManyParams) ([]*RiverJob, error) {
 	rows, err := db.Query(ctx, jobSetStateIfRunningMany,
 		arg.IDs,
@@ -1773,6 +1813,9 @@ func (q *Queries) JobSetStateIfRunningMany(ctx context.Context, db DBTX, arg *Jo
 		arg.Attempt,
 		arg.ErrorsDoUpdate,
 		arg.Errors,
+		arg.ExpectedAttempt,
+		arg.ExpectedAttemptedAt,
+		arg.ExpectedClaimDoCheck,
 		arg.FinalizedAtDoUpdate,
 		arg.FinalizedAt,
 		arg.MetadataDoMerge,

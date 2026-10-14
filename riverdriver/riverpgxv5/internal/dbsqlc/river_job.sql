@@ -734,6 +734,9 @@ WITH job_input AS (
         unnest(@attempt::int[])                    AS attempt,
         unnest(@errors_do_update::boolean[])       AS errors_do_update,
         unnest(@errors::jsonb[])                   AS errors,
+        unnest(@expected_attempt::bigint[])        AS expected_attempt,
+        unnest(@expected_attempted_at::timestamptz[]) AS expected_attempted_at,
+        unnest(@expected_claim_do_check::boolean[]) AS expected_claim_do_check,
         unnest(@finalized_at_do_update::boolean[]) AS finalized_at_do_update,
         unnest(@finalized_at::timestamptz[])       AS finalized_at,
         unnest(@metadata_do_merge::boolean[])      AS metadata_do_merge,
@@ -743,6 +746,22 @@ WITH job_input AS (
         -- To avoid requiring pgx users to register the OID of the river_job_state[]
         -- type, we cast the array to text[] and then to river_job_state.
         unnest(@state::text[])::/* TEMPLATE: schema */river_job_state AS state
+),
+-- Acquire the row locks before checking lease time. A request that waits for a
+-- writer must not complete using an expiry sampled before the lock was granted.
+locked_jobs AS (
+    SELECT river_job.id
+    FROM /* TEMPLATE: schema */river_job
+    JOIN job_input ON river_job.id = job_input.id
+    ORDER BY river_job.id
+    FOR UPDATE OF river_job
+),
+-- Consume every lock before sampling time, including when an earlier row's
+-- lease expires while the batch waits for a later row. Materialization also
+-- prevents the planner from evaluating the expiry predicate before locking.
+locked_batch AS MATERIALIZED (
+    SELECT array_agg(id) AS ids, clock_timestamp() AS checked_at
+    FROM locked_jobs
 ),
 updated AS (
     UPDATE /* TEMPLATE: schema */river_job
@@ -790,9 +809,18 @@ updated AS (
             THEN job_input.state
             ELSE river_job.state
         END
-    FROM job_input
+    FROM job_input, locked_batch
     WHERE river_job.id = job_input.id
+      AND river_job.id = ANY(locked_batch.ids)
       AND (river_job.state = 'running' OR job_input.metadata_do_merge)
+      AND (
+          (NOT job_input.expected_claim_do_check AND river_job.lease_expires_at IS NULL)
+          OR (job_input.expected_claim_do_check
+              AND river_job.state = 'running'
+              AND river_job.attempt = job_input.expected_attempt
+              AND river_job.attempted_at = job_input.expected_attempted_at
+              AND river_job.lease_expires_at > locked_batch.checked_at)
+      )
     RETURNING river_job.*
 )
 SELECT river_job.*
@@ -802,6 +830,15 @@ WHERE NOT EXISTS (
     SELECT 1
     FROM updated
     WHERE updated.id = river_job.id
+)
+AND (
+    (NOT job_input.expected_claim_do_check AND river_job.lease_expires_at IS NULL)
+    OR (job_input.expected_claim_do_check
+        AND river_job.state != 'running'
+        AND river_job.attempted_at = job_input.expected_attempted_at
+        AND river_job.attempt = CASE
+            WHEN job_input.attempt_do_update AND river_job.state = job_input.state THEN job_input.attempt
+            ELSE job_input.expected_attempt END)
 )
 UNION ALL
 SELECT *

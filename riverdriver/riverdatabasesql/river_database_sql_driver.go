@@ -753,24 +753,35 @@ func (e *Executor) JobSchedule(ctx context.Context, params *riverdriver.JobSched
 }
 
 func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	if err := params.ValidateExpectedClaims(); err != nil {
+		return nil, err
+	}
 	setStateParams := &dbsqlc.JobSetStateIfRunningManyParams{
-		IDs:                 params.ID,
-		Attempt:             make([]int32, len(params.ID)),
-		AttemptDoUpdate:     make([]bool, len(params.ID)),
-		Errors:              make([]string, len(params.ID)),
-		ErrorsDoUpdate:      make([]bool, len(params.ID)),
-		FinalizedAt:         make([]time.Time, len(params.ID)),
-		FinalizedAtDoUpdate: make([]bool, len(params.ID)),
-		MetadataDoMerge:     make([]bool, len(params.ID)),
-		MetadataUpdates:     make([]string, len(params.ID)),
-		ScheduledAt:         make([]time.Time, len(params.ID)),
-		ScheduledAtDoUpdate: make([]bool, len(params.ID)),
-		State:               make([]string, len(params.ID)),
+		IDs:                  params.ID,
+		Attempt:              make([]int32, len(params.ID)),
+		AttemptDoUpdate:      make([]bool, len(params.ID)),
+		Errors:               make([]string, len(params.ID)),
+		ErrorsDoUpdate:       make([]bool, len(params.ID)),
+		ExpectedAttempt:      make([]int64, len(params.ID)),
+		ExpectedAttemptedAt:  make([]time.Time, len(params.ID)),
+		ExpectedClaimDoCheck: make([]bool, len(params.ID)),
+		FinalizedAt:          make([]time.Time, len(params.ID)),
+		FinalizedAtDoUpdate:  make([]bool, len(params.ID)),
+		MetadataDoMerge:      make([]bool, len(params.ID)),
+		MetadataUpdates:      make([]string, len(params.ID)),
+		ScheduledAt:          make([]time.Time, len(params.ID)),
+		ScheduledAtDoUpdate:  make([]bool, len(params.ID)),
+		State:                make([]string, len(params.ID)),
 	}
 
 	const defaultObject = "{}"
 
 	for i := range len(params.ID) {
+		if len(params.ExpectedAttempt) > 0 && params.ExpectedAttempt[i] != nil {
+			setStateParams.ExpectedClaimDoCheck[i] = true
+			setStateParams.ExpectedAttempt[i] = int64(*params.ExpectedAttempt[i])
+			setStateParams.ExpectedAttemptedAt[i] = *params.ExpectedAttemptedAt[i]
+		}
 		setStateParams.Errors[i] = cmp.Or(string(params.ErrData[i]), defaultObject)
 		if params.Attempt[i] != nil {
 			attempt, err := intToInt32(*params.Attempt[i])

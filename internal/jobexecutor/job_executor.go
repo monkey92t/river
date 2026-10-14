@@ -496,7 +496,7 @@ func (e *JobExecutor) reportResult(ctx context.Context, jobRow *rivertype.JobRow
 		} else {
 			params = riverdriver.JobSetStateSnoozed(jobRow.ID, nextAttemptScheduledAt, jobRow.Attempt-1, metadataUpdatesBytes)
 		}
-		if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, params); err != nil {
+		if err := e.setState(ctx, jobRow, params); err != nil {
 			e.Logger.ErrorContext(ctx, e.Name+": Error snoozing job",
 				slog.Int64("job_id", jobRow.ID),
 			)
@@ -515,7 +515,7 @@ func (e *JobExecutor) reportResult(ctx context.Context, jobRow *rivertype.JobRow
 		return
 	}
 
-	if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, riverdriver.JobSetStateCompleted(jobRow.ID, e.Time.Now(), metadataUpdatesBytes)); err != nil {
+	if err := e.setState(ctx, jobRow, riverdriver.JobSetStateCompleted(jobRow.ID, e.Time.Now(), metadataUpdatesBytes)); err != nil {
 		e.Logger.ErrorContext(ctx, e.Name+": Error completing job",
 			slog.String("err", err.Error()),
 			slog.Int64("job_id", jobRow.ID),
@@ -562,7 +562,7 @@ func (e *JobExecutor) reportError(ctx context.Context, jobRow *rivertype.JobRow,
 
 	if softStopped {
 		params := riverdriver.JobSetStateInterrupted(jobRow.ID, now, max(jobRow.Attempt-1, 0), metadataUpdates)
-		if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, params); err != nil {
+		if err := e.setState(ctx, jobRow, params); err != nil {
 			e.Logger.ErrorContext(ctx, e.Name+": Failed to make soft-stopped job available", logAttrs...)
 		}
 		return
@@ -582,14 +582,14 @@ func (e *JobExecutor) reportError(ctx context.Context, jobRow *rivertype.JobRow,
 	}
 
 	if cancelJob {
-		if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, riverdriver.JobSetStateCancelled(jobRow.ID, now, errData, metadataUpdates)); err != nil {
+		if err := e.setState(ctx, jobRow, riverdriver.JobSetStateCancelled(jobRow.ID, now, errData, metadataUpdates)); err != nil {
 			e.Logger.ErrorContext(ctx, e.Name+": Failed to cancel job and report error", logAttrs...)
 		}
 		return
 	}
 
 	if jobRow.Attempt >= jobRow.MaxAttempts {
-		if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, riverdriver.JobSetStateDiscarded(jobRow.ID, now, errData, metadataUpdates)); err != nil {
+		if err := e.setState(ctx, jobRow, riverdriver.JobSetStateDiscarded(jobRow.ID, now, errData, metadataUpdates)); err != nil {
 			e.Logger.ErrorContext(ctx, e.Name+": Failed to discard job and report error", logAttrs...)
 		}
 		return
@@ -624,9 +624,15 @@ func (e *JobExecutor) reportError(ctx context.Context, jobRow *rivertype.JobRow,
 	} else {
 		params = riverdriver.JobSetStateErrorRetryable(jobRow.ID, nextRetryScheduledAt, errData, metadataUpdates)
 	}
-	if err := e.Completer.JobSetStateIfRunning(ctx, e.stats, params); err != nil {
+	if err := e.setState(ctx, jobRow, params); err != nil {
 		e.Logger.ErrorContext(ctx, e.Name+": Failed to report error for job", logAttrs...)
 	}
+}
+
+// setState attaches the leased claim to every execution-result transition.
+func (e *JobExecutor) setState(ctx context.Context, jobRow *rivertype.JobRow, params *riverdriver.JobSetStateIfRunningParams) error {
+	params.SetExpectedClaim(jobRow)
+	return e.Completer.JobSetStateIfRunning(ctx, e.stats, params)
 }
 
 // isSoftStopCancelError reports whether a worker returned because the client

@@ -161,6 +161,10 @@ func (c *InlineCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobst
 	if err != nil {
 		return err
 	}
+	if len(jobs) == 0 && joblease.FromContext(ctx) != nil {
+		joblease.FromContext(ctx).Abandon()
+		return rivertype.ErrJobLeaseLost
+	}
 	if !joblease.FromContext(ctx).Finish() {
 		return rivertype.ErrJobLeaseLost
 	}
@@ -209,16 +213,18 @@ func (c *InlineCompleter) Start(ctx context.Context) error {
 
 func setStateParamsToMany(now *time.Time, schema string, params *riverdriver.JobSetStateIfRunningParams) *riverdriver.JobSetStateIfRunningManyParams {
 	return &riverdriver.JobSetStateIfRunningManyParams{
-		Attempt:         []*int{params.Attempt},
-		ErrData:         [][]byte{params.ErrData},
-		FinalizedAt:     []*time.Time{params.FinalizedAt},
-		ID:              []int64{params.ID},
-		MetadataDoMerge: []bool{params.MetadataDoMerge},
-		MetadataUpdates: [][]byte{params.MetadataUpdates},
-		Now:             now,
-		ScheduledAt:     []*time.Time{params.ScheduledAt},
-		Schema:          schema,
-		State:           []rivertype.JobState{params.State},
+		Attempt:             []*int{params.Attempt},
+		ErrData:             [][]byte{params.ErrData},
+		ExpectedAttempt:     []*int{params.ExpectedAttempt},
+		ExpectedAttemptedAt: []*time.Time{params.ExpectedAttemptedAt},
+		FinalizedAt:         []*time.Time{params.FinalizedAt},
+		ID:                  []int64{params.ID},
+		MetadataDoMerge:     []bool{params.MetadataDoMerge},
+		MetadataUpdates:     [][]byte{params.MetadataUpdates},
+		Now:                 now,
+		ScheduledAt:         []*time.Time{params.ScheduledAt},
+		Schema:              schema,
+		State:               []rivertype.JobState{params.State},
 	}
 }
 
@@ -276,6 +282,10 @@ func (c *AsyncCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobsta
 		})
 		if err != nil {
 			return err
+		}
+		if len(jobs) == 0 && joblease.FromContext(ctx) != nil {
+			joblease.FromContext(ctx).Abandon()
+			return rivertype.ErrJobLeaseLost
 		}
 		if !joblease.FromContext(ctx).Finish() {
 			return rivertype.ErrJobLeaseLost
@@ -551,8 +561,18 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 
 		// Retain confirmed events even if a later sub-batch fails, while
 		// preserving one event batch for a normally completed full batch.
+		returned := make(map[int64]bool, len(jobRows))
+		for _, row := range jobRows {
+			returned[row.ID] = true
+		}
 		for _, id := range batchParams.ID {
-			confirmed[id] = setStateBatch[id].Guard.Finish()
+			guard := setStateBatch[id].Guard
+			if guard != nil && !returned[id] {
+				guard.Abandon()
+				confirmed[id] = false
+				continue
+			}
+			confirmed[id] = guard.Finish()
 		}
 		completeTime := c.Time.Now()
 		if events == nil {
@@ -575,20 +595,24 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 	// done this way to allocate as few new slices as necessary.
 	mapBatch := func(setStateBatch map[int64]batchCompleterSetState) *riverdriver.JobSetStateIfRunningManyParams {
 		params := &riverdriver.JobSetStateIfRunningManyParams{
-			ID:              make([]int64, len(setStateBatch)),
-			Attempt:         make([]*int, len(setStateBatch)),
-			ErrData:         make([][]byte, len(setStateBatch)),
-			FinalizedAt:     make([]*time.Time, len(setStateBatch)),
-			MetadataDoMerge: make([]bool, len(setStateBatch)),
-			MetadataUpdates: make([][]byte, len(setStateBatch)),
-			ScheduledAt:     make([]*time.Time, len(setStateBatch)),
-			State:           make([]rivertype.JobState, len(setStateBatch)),
+			ID:                  make([]int64, len(setStateBatch)),
+			Attempt:             make([]*int, len(setStateBatch)),
+			ErrData:             make([][]byte, len(setStateBatch)),
+			ExpectedAttempt:     make([]*int, len(setStateBatch)),
+			ExpectedAttemptedAt: make([]*time.Time, len(setStateBatch)),
+			FinalizedAt:         make([]*time.Time, len(setStateBatch)),
+			MetadataDoMerge:     make([]bool, len(setStateBatch)),
+			MetadataUpdates:     make([][]byte, len(setStateBatch)),
+			ScheduledAt:         make([]*time.Time, len(setStateBatch)),
+			State:               make([]rivertype.JobState, len(setStateBatch)),
 		}
 		var i int
 		for _, setState := range setStateBatch {
 			params.ID[i] = setState.Params.ID
 			params.Attempt[i] = setState.Params.Attempt
 			params.ErrData[i] = setState.Params.ErrData
+			params.ExpectedAttempt[i] = setState.Params.ExpectedAttempt
+			params.ExpectedAttemptedAt[i] = setState.Params.ExpectedAttemptedAt
 			params.FinalizedAt[i] = setState.Params.FinalizedAt
 			params.MetadataDoMerge[i] = setState.Params.MetadataDoMerge
 			params.MetadataUpdates[i] = setState.Params.MetadataUpdates
@@ -611,15 +635,17 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 		for i := 0; i < len(setStateBatch); i += c.completionMaxSize {
 			endIndex := min(i+c.completionMaxSize, len(params.ID)) // beginning of next sub-batch or end of slice
 			subBatch := &riverdriver.JobSetStateIfRunningManyParams{
-				ID:              params.ID[i:endIndex],
-				Attempt:         params.Attempt[i:endIndex],
-				ErrData:         params.ErrData[i:endIndex],
-				FinalizedAt:     params.FinalizedAt[i:endIndex],
-				MetadataDoMerge: params.MetadataDoMerge[i:endIndex],
-				MetadataUpdates: params.MetadataUpdates[i:endIndex],
-				ScheduledAt:     params.ScheduledAt[i:endIndex],
-				Schema:          params.Schema,
-				State:           params.State[i:endIndex],
+				ID:                  params.ID[i:endIndex],
+				Attempt:             params.Attempt[i:endIndex],
+				ErrData:             params.ErrData[i:endIndex],
+				ExpectedAttempt:     params.ExpectedAttempt[i:endIndex],
+				ExpectedAttemptedAt: params.ExpectedAttemptedAt[i:endIndex],
+				FinalizedAt:         params.FinalizedAt[i:endIndex],
+				MetadataDoMerge:     params.MetadataDoMerge[i:endIndex],
+				MetadataUpdates:     params.MetadataUpdates[i:endIndex],
+				ScheduledAt:         params.ScheduledAt[i:endIndex],
+				Schema:              params.Schema,
+				State:               params.State[i:endIndex],
 			}
 			if err := completeSubBatch(subBatch); err != nil {
 				return handleBatchError(err)

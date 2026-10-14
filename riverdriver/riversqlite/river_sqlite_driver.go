@@ -1009,6 +1009,9 @@ func (e *Executor) JobSchedule(ctx context.Context, params *riverdriver.JobSched
 }
 
 func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	if err := params.ValidateExpectedClaims(); err != nil {
+		return nil, err
+	}
 	setRes := make([]*rivertype.JobRow, 0, len(params.ID))
 
 	if err := dbutil.WithTx(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) error {
@@ -1025,6 +1028,11 @@ func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdr
 				State:           string(params.State[i]),
 			}
 
+			if len(params.ExpectedAttempt) > 0 && params.ExpectedAttempt[i] != nil {
+				setStateParams.ExpectedClaimDoCheck = true
+				setStateParams.ExpectedAttempt = int64(*params.ExpectedAttempt[i])
+				setStateParams.ExpectedAttemptedAt = timeString(*params.ExpectedAttemptedAt[i])
+			}
 			if params.Attempt[i] != nil {
 				setStateParams.AttemptDoUpdate = true
 				setStateParams.Attempt = int64(*params.Attempt[i])
@@ -1051,8 +1059,14 @@ func (e *Executor) JobSetStateIfRunningMany(ctx context.Context, params *riverdr
 				if errors.Is(err, sql.ErrNoRows) {
 					var metadataRow *dbsqlc.JobSetMetadataIfNotRunningRow
 					metadataRow, err = dbsqlc.New().JobSetMetadataIfNotRunning(ctx, dbtx, &dbsqlc.JobSetMetadataIfNotRunningParams{
-						ID:              params.ID[i],
-						MetadataUpdates: sliceutil.FirstNonEmpty(params.MetadataUpdates[i], []byte("{}")),
+						ID:                   params.ID[i],
+						ExpectedAttempt:      setStateParams.ExpectedAttempt,
+						ExpectedAttemptedAt:  setStateParams.ExpectedAttemptedAt,
+						ExpectedClaimDoCheck: setStateParams.ExpectedClaimDoCheck,
+						Attempt:              setStateParams.Attempt,
+						AttemptDoUpdate:      setStateParams.AttemptDoUpdate,
+						State:                setStateParams.State,
+						MetadataUpdates:      sliceutil.FirstNonEmpty(params.MetadataUpdates[i], []byte("{}")),
 					})
 					if err != nil {
 						if errors.Is(err, sql.ErrNoRows) {

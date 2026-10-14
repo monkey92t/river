@@ -64,6 +64,16 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 		require.NoError(t, err)
 	}
 
+	completionParams := func(job *rivertype.JobRow, state rivertype.JobState) *riverdriver.JobSetStateIfRunningManyParams {
+		return &riverdriver.JobSetStateIfRunningManyParams{
+			ID: []int64{job.ID}, Attempt: []*int{nil}, ErrData: [][]byte{nil},
+			ExpectedAttempt: []*int{new(job.Attempt)}, ExpectedAttemptedAt: []*time.Time{job.AttemptedAt},
+			FinalizedAt: []*time.Time{new(time.Now().UTC())}, MetadataDoMerge: []bool{true},
+			MetadataUpdates: [][]byte{[]byte(`{"completion":"original"}`)}, ScheduledAt: []*time.Time{nil},
+			State: []rivertype.JobState{state},
+		}
+	}
+
 	t.Run("JobLease", func(t *testing.T) {
 		t.Parallel()
 
@@ -142,6 +152,227 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 			require.WithinDuration(t, before.Add(time.Minute), *claimed.Jobs[0].LeaseExpiresAt, 5*time.Second)
 		})
 
+		t.Run("CompletionBatchKeepsValidAndLegacyMembers", func(t *testing.T) {
+			t.Parallel()
+
+			exec, driver := executorWithTx(ctx, t)
+			stale := claim(t, exec, time.Minute)
+			stale = setExpiry(t, exec, driver, stale.ID, time.Now().Add(-time.Second))
+			valid := claim(t, exec, time.Minute)
+			legacy := claim(t, exec, 0)
+			batch := &riverdriver.JobSetStateIfRunningManyParams{}
+			for _, job := range []*rivertype.JobRow{stale, valid, legacy} {
+				params := completionParams(job, rivertype.JobStateCompleted)
+				batch.ID = append(batch.ID, params.ID[0])
+				batch.Attempt = append(batch.Attempt, nil)
+				batch.ErrData = append(batch.ErrData, nil)
+				batch.ExpectedAttempt = append(batch.ExpectedAttempt, params.ExpectedAttempt[0])
+				batch.ExpectedAttemptedAt = append(batch.ExpectedAttemptedAt, params.ExpectedAttemptedAt[0])
+				batch.FinalizedAt = append(batch.FinalizedAt, params.FinalizedAt[0])
+				batch.MetadataDoMerge = append(batch.MetadataDoMerge, false)
+				batch.MetadataUpdates = append(batch.MetadataUpdates, nil)
+				batch.ScheduledAt = append(batch.ScheduledAt, nil)
+				batch.State = append(batch.State, rivertype.JobStateCompleted)
+			}
+			batch.ExpectedAttempt[2], batch.ExpectedAttemptedAt[2] = nil, nil
+			jobs, err := exec.JobSetStateIfRunningMany(ctx, batch)
+			require.NoError(t, err)
+			require.Len(t, jobs, 2)
+			ids := []int64{jobs[0].ID, jobs[1].ID}
+			require.ElementsMatch(t, []int64{valid.ID, legacy.ID}, ids)
+			for _, job := range jobs {
+				require.Equal(t, rivertype.JobStateCompleted, job.State)
+			}
+			stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: stale.ID})
+			require.NoError(t, err)
+			require.Equal(t, stale, stored)
+		})
+
+		t.Run("CompletionRejectsExpiredLease", func(t *testing.T) {
+			t.Parallel()
+
+			exec, driver := executorWithTx(ctx, t)
+			job := claim(t, exec, time.Minute)
+			job = setExpiry(t, exec, driver, job.ID, time.Now().Add(-time.Second))
+			jobs, err := exec.JobSetStateIfRunningMany(ctx, completionParams(job, rivertype.JobStateCompleted))
+			require.NoError(t, err)
+			require.Empty(t, jobs)
+			stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, job, stored)
+		})
+
+		t.Run("CompletionRejectsMismatchedClaim", func(t *testing.T) {
+			t.Parallel()
+
+			for _, mismatch := range []string{"Attempt", "AttemptedAt", "Missing"} {
+				t.Run(mismatch, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := executorWithTx(ctx, t)
+					job := claim(t, exec, time.Minute)
+					params := completionParams(job, rivertype.JobStateCompleted)
+					switch mismatch {
+					case "Attempt":
+						params.ExpectedAttempt[0] = new(job.Attempt + 1)
+					case "AttemptedAt":
+						params.ExpectedAttemptedAt[0] = new(job.AttemptedAt.Add(-time.Second))
+					case "Missing":
+						params.ExpectedAttempt = nil
+						params.ExpectedAttemptedAt = nil
+					}
+					jobs, err := exec.JobSetStateIfRunningMany(ctx, params)
+					require.NoError(t, err)
+					require.Empty(t, jobs)
+					stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+					require.NoError(t, err)
+					require.Equal(t, job, stored)
+				})
+			}
+		})
+
+		t.Run("CompletionRejectsPreviousClaimAfterRescue", func(t *testing.T) {
+			t.Parallel()
+
+			for _, state := range []rivertype.JobState{rivertype.JobStateAvailable, rivertype.JobStateCancelled, rivertype.JobStateCompleted, rivertype.JobStateDiscarded, rivertype.JobStateRetryable, rivertype.JobStateScheduled} {
+				t.Run(string(state), func(t *testing.T) {
+					t.Parallel()
+
+					exec, driver := executorWithTx(ctx, t)
+					previous := claim(t, exec, time.Minute)
+					params := completionParams(previous, state)
+					// Exercise all values that an old error or Snooze could overwrite.
+					params.Attempt[0] = new(max(previous.Attempt-1, 0))
+					params.ErrData[0] = []byte(`{"error":"stale error"}`)
+					params.ScheduledAt[0] = new(time.Now().Add(time.Hour))
+					expired := setExpiry(t, exec, driver, previous.ID, time.Now().Add(-time.Minute))
+					rescue(t, exec, expired, 0)
+					claimed, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+						ClientID: testClientID, LeaseDuration: time.Minute, MaxAttemptedBy: 10,
+						MaxToLock: 1, Now: previous.AttemptedAt, Queue: previous.Queue,
+					})
+					require.NoError(t, err)
+					require.Len(t, claimed.Jobs, 1)
+					current := claimed.Jobs[0]
+					require.Equal(t, previous.AttemptedAt, current.AttemptedAt)
+					require.Equal(t, previous.Attempt+1, current.Attempt)
+					jobs, err := exec.JobSetStateIfRunningMany(ctx, params)
+					require.NoError(t, err)
+					require.Empty(t, jobs)
+					stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: current.ID})
+					require.NoError(t, err)
+					require.Equal(t, current, stored)
+					// Even B's subsequent completion must not make A's metadata eligible.
+					jobs, err = exec.JobSetStateIfRunningMany(ctx, completionParams(current, rivertype.JobStateCompleted))
+					require.NoError(t, err)
+					require.Len(t, jobs, 1)
+					before := jobs[0]
+					jobs, err = exec.JobSetStateIfRunningMany(ctx, params)
+					require.NoError(t, err)
+					require.Empty(t, jobs)
+					stored, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: current.ID})
+					require.NoError(t, err)
+					require.Equal(t, before, stored)
+				})
+			}
+		})
+
+		t.Run("CompletionRetryDoesNotRewriteConfirmedResult", func(t *testing.T) {
+			t.Parallel()
+
+			for _, snooze := range []bool{false, true} {
+				name := "Completed"
+				if snooze {
+					name = "Snoozed"
+				}
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := executorWithTx(ctx, t)
+					job := claim(t, exec, time.Minute)
+					params := completionParams(job, rivertype.JobStateCompleted)
+					if snooze {
+						params.State[0] = rivertype.JobStateScheduled
+						params.FinalizedAt[0] = nil
+						params.Attempt[0] = new(job.Attempt - 1)
+						params.ScheduledAt[0] = new(time.Now().Add(time.Hour))
+					}
+					jobs, err := exec.JobSetStateIfRunningMany(ctx, params)
+					require.NoError(t, err)
+					require.Len(t, jobs, 1)
+					before := jobs[0]
+					// Losing a response allows confirmation, but no extra metadata write.
+					params.MetadataUpdates[0] = []byte(`{"completion":"changed"}`)
+					jobs, err = exec.JobSetStateIfRunningMany(ctx, params)
+					require.NoError(t, err)
+					require.Len(t, jobs, 1)
+					require.Equal(t, before, jobs[0])
+				})
+			}
+		})
+
+		t.Run("CompletionWaitsForLocksBeforeCheckingLease", func(t *testing.T) {
+			t.Parallel()
+
+			driver, schema := driverWithSchema(ctx, t, nil)
+			if driver.DatabaseName() != riverdriver.DatabaseNamePostgres {
+				t.Skip("Postgres row locks; SQLite serializes writes")
+			}
+			exec := driver.GetExecutor()
+			seed := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Schema: schema})
+			claimed, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+				ClientID: testClientID, LeaseDuration: time.Minute, MaxAttemptedBy: 10,
+				MaxToLock: 1, Queue: seed.Queue, Schema: schema,
+			})
+			require.NoError(t, err)
+			require.Len(t, claimed.Jobs, 1)
+			job := claimed.Jobs[0]
+			// Commit the short lease before taking an otherwise read-only lock.
+			// The tuple stays unchanged while the completion request waits.
+			require.NoError(t, exec.Exec(ctx, "UPDATE "+migrationSchemaPrefix(schema)+"river_job SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE id=$1", job.ID))
+			blocker, err := exec.Begin(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = blocker.Rollback(ctx) })
+			var lockedID int64
+			require.NoError(t, blocker.QueryRow(ctx, "SELECT id FROM "+migrationSchemaPrefix(schema)+"river_job WHERE id = $1 FOR UPDATE", job.ID).Scan(&lockedID))
+			params := completionParams(job, rivertype.JobStateCompleted)
+			params.Schema = schema
+			type result struct {
+				rows []*rivertype.JobRow
+				err  error
+			}
+			// A buffered result channel lets the query finish during cleanup even
+			// if a lock-wait assertion fails before the result is consumed.
+			done := make(chan result, 1)
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			requestTx, err := exec.Begin(requestCtx)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = requestTx.Rollback(ctx) })
+			var backendPID int
+			require.NoError(t, requestTx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPID))
+			go func() {
+				rows, err := requestTx.JobSetStateIfRunningMany(requestCtx, params)
+				done <- result{rows: rows, err: err}
+			}()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				err := exec.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid=$1)", backendPID).Scan(&waiting)
+				return err == nil && waiting
+			}, time.Second, 10*time.Millisecond)
+			// Time deliberately advances beyond the granted lease while SQL waits.
+			time.Sleep(2 * time.Second)
+			require.NoError(t, blocker.Commit(ctx))
+			res := <-done
+			require.NoError(t, res.err)
+			require.Empty(t, res.rows)
+			require.NoError(t, requestTx.Rollback(ctx))
+			stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRunning, stored.State)
+			require.Equal(t, job.Metadata, stored.Metadata)
+		})
+
 		t.Run("ExpiredLeaseCannotRenew", func(t *testing.T) {
 			t.Parallel()
 
@@ -156,6 +387,30 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 			})
 			require.NoError(t, err)
 			require.Empty(t, renewed)
+		})
+
+		t.Run("InvalidCompletionClaimParameters", func(t *testing.T) {
+			t.Parallel()
+
+			for _, invalid := range []string{"AttemptLength", "AttemptedAtLength", "IncompletePair"} {
+				t.Run(invalid, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := executorWithTx(ctx, t)
+					job := claim(t, exec, time.Minute)
+					params := completionParams(job, rivertype.JobStateCompleted)
+					switch invalid {
+					case "AttemptLength":
+						params.ExpectedAttempt = nil
+					case "AttemptedAtLength":
+						params.ExpectedAttemptedAt = nil
+					case "IncompletePair":
+						params.ExpectedAttemptedAt[0] = nil
+					}
+					_, err := exec.JobSetStateIfRunningMany(ctx, params)
+					require.ErrorContains(t, err, "completion requires")
+				})
+			}
 		})
 
 		t.Run("InvalidRenewalParameters", func(t *testing.T) {
@@ -380,14 +635,16 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 						finalizedAt = new(time.Now().UTC())
 					}
 					jobs, err := exec.JobSetStateIfRunningMany(ctx, &riverdriver.JobSetStateIfRunningManyParams{
-						ID:              []int64{job.ID},
-						Attempt:         []*int{nil},
-						ErrData:         [][]byte{nil},
-						FinalizedAt:     []*time.Time{finalizedAt},
-						MetadataDoMerge: []bool{false},
-						MetadataUpdates: [][]byte{nil},
-						ScheduledAt:     []*time.Time{nil},
-						State:           []rivertype.JobState{state},
+						ID:                  []int64{job.ID},
+						ExpectedAttempt:     []*int{new(job.Attempt)},
+						ExpectedAttemptedAt: []*time.Time{job.AttemptedAt},
+						Attempt:             []*int{nil},
+						ErrData:             [][]byte{nil},
+						FinalizedAt:         []*time.Time{finalizedAt},
+						MetadataDoMerge:     []bool{false},
+						MetadataUpdates:     [][]byte{nil},
+						ScheduledAt:         []*time.Time{nil},
+						State:               []rivertype.JobState{state},
 					})
 					require.NoError(t, err)
 					require.Len(t, jobs, 1)

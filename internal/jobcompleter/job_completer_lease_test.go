@@ -156,7 +156,7 @@ func TestBatchCompleter_Lease(t *testing.T) {
 		require.Same(t, newGuard, bundle.completer.setStateParams[1].Guard)
 	})
 
-	t.Run("RenewUntilConfirmation", func(t *testing.T) {
+	t.Run("RejectedClaimStopsRenewal", func(t *testing.T) {
 		t.Parallel()
 
 		bundle := setup(t)
@@ -167,12 +167,80 @@ func TestBatchCompleter_Lease(t *testing.T) {
 		require.False(t, guard.Finished())
 		require.NoError(t, guard.Check())
 		bundle.exec.JobSetStateIfRunningManyFunc = func(context.Context, *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
-			return nil, nil // A deleted job's zero-row confirmation ends renewal too.
+			return nil, nil // No row can also mean the execution claim was rejected.
 		}
 
 		require.NoError(t, bundle.completer.handleBatch(context.Background()))
-		require.True(t, guard.Finished())
+		require.False(t, guard.Finished())
+		require.ErrorIs(t, guard.Check(), rivertype.ErrJobLeaseLost)
+		require.Empty(t, bundle.updates)
 	})
+}
+
+// TestBatchCompleter_ClaimConditions checks identity propagation through splitting
+// and retries without publishing an event for a rejected member.
+func TestBatchCompleter_ClaimConditions(t *testing.T) {
+	t.Parallel()
+
+	exec := &partialExecutorMock{}
+	updates := make(chan []CompleterJobUpdated, 10)
+	completer := NewBatchCompleter(riversharedtest.BaseServiceArchetype(t), "", exec, &riverpilot.StandardPilot{}, updates)
+	completer.completionMaxSize = 1
+	completer.disableSleep = true
+	guards := make(map[int64]*joblease.Guard)
+	claimedAt := time.Now()
+	for _, id := range []int64{1, 2} {
+		guard := joblease.NewGuard(time.Now().Add(time.Minute), nil)
+		defer guard.Abandon()
+		guards[id] = guard
+		params := riverdriver.JobSetStateCompleted(id, time.Now(), nil)
+		params.SetExpectedClaim(&rivertype.JobRow{Attempt: int(id), AttemptedAt: &claimedAt, LeaseExpiresAt: new(time.Now().Add(time.Minute))})
+		require.NoError(t, completer.JobSetStateIfRunning(joblease.WithGuard(context.Background(), guard), &jobstats.JobStatistics{}, params))
+	}
+	calls := 0
+	exec.JobSetStateIfRunningManyFunc = func(_ context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+		require.Len(t, params.ID, 1)
+		require.Equal(t, int(params.ID[0]), *params.ExpectedAttempt[0])
+		require.Equal(t, claimedAt, *params.ExpectedAttemptedAt[0])
+		calls++
+		if calls == 1 {
+			return nil, errors.New("response lost")
+		}
+		if params.ID[0] == 1 {
+			return nil, nil // The stale member must not produce an event.
+		}
+		return []*rivertype.JobRow{{ID: 2, State: rivertype.JobStateCompleted}}, nil
+	}
+
+	require.NoError(t, completer.handleBatch(context.Background()))
+	require.Equal(t, 3, calls)
+	require.ErrorIs(t, guards[1].Check(), rivertype.ErrJobLeaseLost)
+	require.True(t, guards[2].Finished())
+	require.Len(t, updates, 1)
+	events := <-updates
+	require.Len(t, events, 1)
+	require.Equal(t, int64(2), events[0].Job.ID)
+}
+
+// TestInlineCompleter_ClaimRejected verifies that zero-row lease rejection isn't
+// presented as a successful completion.
+func TestInlineCompleter_ClaimRejected(t *testing.T) {
+	t.Parallel()
+
+	guard := joblease.NewGuard(time.Now().Add(time.Minute), nil)
+	defer guard.Abandon()
+	updates := make(chan []CompleterJobUpdated, 1)
+	exec := &partialExecutorMock{JobSetStateIfRunningManyFunc: func(_ context.Context, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+		require.Equal(t, 3, *params.ExpectedAttempt[0])
+		return nil, nil
+	}}
+	completer := NewInlineCompleter(riversharedtest.BaseServiceArchetype(t), "", exec, &riverpilot.StandardPilot{}, updates)
+	params := riverdriver.JobSetStateCompleted(1, time.Now(), nil)
+	params.SetExpectedClaim(&rivertype.JobRow{Attempt: 3, AttemptedAt: new(time.Now()), LeaseExpiresAt: new(time.Now().Add(time.Minute))})
+	err := completer.JobSetStateIfRunning(joblease.WithGuard(context.Background(), guard), &jobstats.JobStatistics{}, params)
+	require.ErrorIs(t, err, rivertype.ErrJobLeaseLost)
+	require.False(t, guard.Finished())
+	require.Empty(t, updates)
 }
 
 func TestInlineCompleter_LeaseStopsRetry(t *testing.T) {

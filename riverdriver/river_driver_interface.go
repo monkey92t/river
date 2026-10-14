@@ -282,6 +282,9 @@ type Executor interface {
 	// resulting rows. A job row that can't be fully decoded is returned with
 	// the fields that couldn't be decoded left empty so that the state of an
 	// undecodable job can be set without failing the other jobs set with it.
+	// Rejected leased claims are omitted; rows from a newer execution are never
+	// returned as confirmation of an older claim. Matching committed results
+	// may be returned without further writes to support response-loss retries.
 	JobSetStateIfRunningMany(ctx context.Context, params *JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error)
 
 	JobUpdate(ctx context.Context, params *JobUpdateParams) (*rivertype.JobRow, error)
@@ -641,16 +644,31 @@ type JobScheduleResult struct {
 // running job. Use one of the constructors below to ensure a correct
 // combination of parameters.
 type JobSetStateIfRunningParams struct {
-	ID              int64
-	Attempt         *int
-	ErrData         []byte
-	FinalizedAt     *time.Time
-	MetadataDoMerge bool
-	MetadataUpdates []byte
-	Reason          JobSetStateReason
-	ScheduledAt     *time.Time
-	Schema          string // added by completer
-	State           rivertype.JobState
+	ID      int64
+	Attempt *int
+	ErrData []byte
+	// ExpectedAttempt and ExpectedAttemptedAt identify the original leased claim,
+	// independently from Attempt, which is a value to write (e.g. on snooze).
+	ExpectedAttempt     *int
+	ExpectedAttemptedAt *time.Time
+	FinalizedAt         *time.Time
+	MetadataDoMerge     bool
+	MetadataUpdates     []byte
+	Reason              JobSetStateReason
+	ScheduledAt         *time.Time
+	Schema              string // added by completer
+	State               rivertype.JobState
+}
+
+// SetExpectedClaim captures the existing claim fields for a leased execution.
+// Unleased jobs preserve the legacy state-update behavior.
+func (p *JobSetStateIfRunningParams) SetExpectedClaim(job *rivertype.JobRow) {
+	if job.LeaseExpiresAt != nil {
+		p.ExpectedAttempt = new(job.Attempt)
+		if job.AttemptedAt != nil {
+			p.ExpectedAttemptedAt = new(*job.AttemptedAt)
+		}
+	}
 }
 
 // JobSetStateReason describes why a running job's state was changed. It lets
@@ -775,16 +793,36 @@ func JobSetStateSnoozedAvailable(id int64, scheduledAt time.Time, attempt int, m
 // currently running jobs. Use one of the constructors below to ensure a correct
 // combination of parameters.
 type JobSetStateIfRunningManyParams struct {
-	ID              []int64
-	Attempt         []*int
-	ErrData         [][]byte
-	FinalizedAt     []*time.Time
-	MetadataDoMerge []bool
-	MetadataUpdates [][]byte
-	Now             *time.Time
-	ScheduledAt     []*time.Time
-	Schema          string
-	State           []rivertype.JobState
+	ID      []int64
+	Attempt []*int
+	ErrData [][]byte
+	// Expected claim arrays are optional for legacy batches. When present they
+	// align with ID; a pair of nil entries denotes an unleased execution.
+	ExpectedAttempt     []*int
+	ExpectedAttemptedAt []*time.Time
+	FinalizedAt         []*time.Time
+	MetadataDoMerge     []bool
+	MetadataUpdates     [][]byte
+	Now                 *time.Time
+	ScheduledAt         []*time.Time
+	Schema              string
+	State               []rivertype.JobState
+}
+
+// ValidateExpectedClaims rejects incomplete or misaligned claim conditions.
+func (p *JobSetStateIfRunningManyParams) ValidateExpectedClaims() error {
+	if len(p.ExpectedAttempt) == 0 && len(p.ExpectedAttemptedAt) == 0 {
+		return nil
+	}
+	if len(p.ExpectedAttempt) != len(p.ID) || len(p.ExpectedAttemptedAt) != len(p.ID) {
+		return errors.New("completion requires expected claim arrays matching IDs")
+	}
+	for i := range p.ID {
+		if (p.ExpectedAttempt[i] == nil) != (p.ExpectedAttemptedAt[i] == nil) {
+			return errors.New("completion requires both expected attempt and attempt time")
+		}
+	}
+	return nil
 }
 
 type JobUpdateParams struct {
