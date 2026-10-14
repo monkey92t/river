@@ -23,6 +23,7 @@ import (
 	"github.com/riverqueue/river/internal/dbunique"
 	"github.com/riverqueue/river/internal/jobcompleter"
 	"github.com/riverqueue/river/internal/jobexecutor"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/leadership"
 	"github.com/riverqueue/river/internal/maintenance"
 	"github.com/riverqueue/river/internal/notifier"
@@ -227,6 +228,11 @@ type Config struct {
 	// have been reported stuck.
 	JobStuckHandler JobStuckHandler
 
+	// JobLease enables renewable leases for jobs acquired by this client. Nil
+	// preserves legacy timeout-based rescue. Enable only after upgrading all
+	// runtimes sharing the schema; leases do not replace the business JobTimeout.
+	JobLease *JobLeaseConfig
+
 	// JobStuckThreshold is the amount of time after JobTimeout elapses to
 	// wait before a still-running job is considered stuck.
 	//
@@ -394,8 +400,9 @@ type Config struct {
 	// will result in jobs being stuck for longer than necessary before they are
 	// retried.
 	//
-	// RescueStuckJobsAfter must be greater than JobTimeout. Otherwise, jobs
-	// would become eligible for rescue while they're still running.
+	// For jobs without leases, RescueStuckJobsAfter must be greater than
+	// JobTimeout. Otherwise, jobs would become eligible for rescue while still
+	// running. Leased jobs use JobLease.RescueGracePeriod instead.
 	//
 	// Defaults to 1 hour, or in cases where JobTimeout has been configured and
 	// is greater than 1 hour, JobTimeout + 1 hour.
@@ -560,6 +567,7 @@ func (c *Config) WithDefaults() *Config {
 		ID:                          valutil.ValOrDefaultFunc(c.ID, func() string { return defaultClientID(time.Now().UTC()) }),
 		Hooks:                       c.Hooks,
 		JobInsertMiddleware:         c.JobInsertMiddleware,
+		JobLease:                    c.JobLease.WithDefaults(),
 		JobStuckHandler:             c.JobStuckHandler,
 		JobStuckThreshold:           cmp.Or(c.JobStuckThreshold, JobStuckThresholdDefault),
 		JobTimeout:                  cmp.Or(c.JobTimeout, JobTimeoutDefault),
@@ -591,6 +599,9 @@ func (c *Config) WithDefaults() *Config {
 }
 
 func (c *Config) validate() error {
+	if err := c.JobLease.Validate(); err != nil {
+		return err
+	}
 	if err := c.Sequences.validate(); err != nil {
 		return err
 	}
@@ -636,7 +647,7 @@ func (c *Config) validate() error {
 	if c.RescueStuckJobsAfter < 0 {
 		return errors.New("RescueStuckJobsAfter cannot be less than zero")
 	}
-	if c.RescueStuckJobsAfter < c.JobTimeout {
+	if c.JobLease == nil && c.RescueStuckJobsAfter < c.JobTimeout {
 		return errors.New("RescueStuckJobsAfter cannot be less than JobTimeout")
 	}
 
@@ -775,6 +786,7 @@ type Client[TTx any] struct {
 	pluginLookupByJob     *pluginlookup.JobPluginLookup
 	pluginLookupGlobal    *pluginlookup.PluginLookup
 	insertNotifyLimiter   *notifylimiter.Limiter
+	jobLeaseManager       *joblease.Manager
 	notifier              *notifier.Notifier // may be nil in poll-only mode
 	periodicJobs          *PeriodicJobBundle
 	pilot                 riverpilot.Pilot
@@ -980,6 +992,16 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		}
 
 		client.completer = jobcompleter.NewBatchCompleter(archetype, config.Schema, driver.GetExecutor(), client.pilot, nil)
+		if config.JobLease != nil {
+			leasePilot, ok := client.pilot.(riverpilot.PilotJobLease)
+			if !ok {
+				return nil, errors.New("JobLease requires a Pilot that supports job leases")
+			}
+			client.jobLeaseManager = joblease.NewManager(archetype, config.JobLease, config.Schema, func(ctx context.Context, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
+				return leasePilot.JobRenewLeaseMany(ctx, driver.GetExecutor(), params)
+			})
+			client.services = append(client.services, client.jobLeaseManager)
+		}
 		client.subscriptionManager = newSubscriptionManager(archetype, nil)
 		client.services = append(client.services, client.completer, client.subscriptionManager)
 
@@ -1038,9 +1060,16 @@ func NewClient[TTx any](driver riverdriver.Driver[TTx], config *Config) (*Client
 		}
 
 		{
+			var leaseGracePeriod, rescueInterval time.Duration
+			if config.JobLease != nil {
+				leaseGracePeriod = config.JobLease.RescueGracePeriod
+				rescueInterval = config.JobLease.RescueScanInterval
+			}
 			jobRescuer := maintenance.NewRescuer(archetype, &maintenance.JobRescuerConfig{
 				ClientJobTimeout:  config.JobTimeout,
 				ClientRetryPolicy: config.RetryPolicy,
+				Interval:          rescueInterval,
+				LeaseGracePeriod:  leaseGracePeriod,
 				Pilot:             client.pilot,
 				RescueAfter:       config.RescueStuckJobsAfter,
 				Schema:            config.Schema,
@@ -1242,6 +1271,13 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 			stopServicesOnError()
 			return err
 		}
+		// Renewal must outlive fetch cancellation and queued completion writes.
+		if c.jobLeaseManager != nil {
+			if err := c.jobLeaseManager.Start(context.WithoutCancel(ctx)); err != nil {
+				stopServicesOnError()
+				return err
+			}
+		}
 
 		// We use separate contexts for fetching and working to allow for a
 		// graceful stop. When SoftStopTimeout is configured, the work context
@@ -1337,6 +1373,10 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		c.baseService.Logger.DebugContext(ctx, c.baseService.Name+": All producers stopped")
 
 		c.workCancel(rivercommon.ErrStop)
+		if c.jobLeaseManager != nil {
+			c.completer.Stop()
+			c.jobLeaseManager.Stop()
+		}
 
 		// Stop all mainline services where stop order isn't important.
 		// This list of services contains the completer, which should always
@@ -1770,6 +1810,11 @@ func (c *Client[TTx]) JobUpdateTx(ctx context.Context, tx TTx, id int64, params 
 }
 
 func (c *Client[TTx]) jobUpdate(ctx context.Context, exec riverdriver.Executor, id int64, params *JobUpdateParams) (*rivertype.JobRow, error) {
+	ctx, release, err := joblease.FromContext(ctx).Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if params == nil {
 		params = &JobUpdateParams{}
 	}
@@ -2447,6 +2492,8 @@ func (c *Client[TTx]) producerAdd(queueName string, queueConfig QueueConfig) (*p
 		PluginLookupByJob:            c.pluginLookupByJob,
 		PluginLookupGlobal:           c.pluginLookupGlobal,
 		JobStuckHandler:              c.config.JobStuckHandler,
+		JobLease:                     c.config.JobLease,
+		JobLeaseManager:              c.jobLeaseManager,
 		JobStuckCount:                &c.stuckJobCount,
 		JobStuckThreshold:            c.config.JobStuckThreshold,
 		JobTimeout:                   c.config.JobTimeout,

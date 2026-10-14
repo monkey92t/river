@@ -8,6 +8,7 @@ import (
 
 	"github.com/riverqueue/river/internal/execution"
 	"github.com/riverqueue/river/internal/jobexecutor"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -31,6 +32,14 @@ import (
 //
 // Returns the updated, completed job.
 func JobCompleteTx[TDriver riverdriver.Driver[TTx], TTx any, TArgs JobArgs](ctx context.Context, tx TTx, job *Job[TArgs]) (*Job[TArgs], error) {
+	if job.LeaseExpiresAt != nil && joblease.FromContext(ctx) == nil {
+		return nil, ErrJobLeaseLost
+	}
+	ctx, release, err := joblease.FromContext(ctx).Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if job.State != rivertype.JobStateRunning {
 		return nil, errors.New("job must be running")
 	}
@@ -46,10 +55,7 @@ func JobCompleteTx[TDriver riverdriver.Driver[TTx], TTx any, TArgs JobArgs](ctx 
 	// extract metadata updates from context
 	metadataUpdates, hasMetadataUpdates := jobexecutor.MetadataUpdatesFromWorkContext(ctx)
 	hasMetadataUpdates = hasMetadataUpdates && len(metadataUpdates) > 0
-	var (
-		metadataUpdatesBytes []byte
-		err                  error
-	)
+	var metadataUpdatesBytes []byte
 	if hasMetadataUpdates {
 		metadataUpdatesBytes, err = json.Marshal(metadataUpdates)
 		if err != nil {

@@ -342,6 +342,7 @@ func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobG
 	jobs, err := dbsqlc.New().JobGetAvailable(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableParams{
 		AttemptedBy:    params.ClientID,
 		Kind:           params.Kind,
+		LeaseDuration:  params.LeaseDuration.Seconds(),
 		MaxAttemptedBy: int32(min(params.MaxAttemptedBy, math.MaxInt32)), //nolint:gosec
 		MaxToLock:      int32(min(params.MaxToLock, math.MaxInt32)),      //nolint:gosec
 		Now:            params.Now,
@@ -384,9 +385,10 @@ func (e *Executor) JobGetCancelRequested(ctx context.Context, params *riverdrive
 
 func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
 	jobs, err := dbsqlc.New().JobGetStuck(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetStuckParams{
-		AfterID:      params.AfterID,
-		Max:          int32(min(params.Max, math.MaxInt32)), //nolint:gosec
-		StuckHorizon: params.StuckHorizon,
+		AfterID:          params.AfterID,
+		LeaseGracePeriod: params.LeaseGracePeriod.Seconds(),
+		Max:              int32(min(params.Max, math.MaxInt32)), //nolint:gosec
+		StuckHorizon:     params.StuckHorizon,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -640,14 +642,33 @@ func (e *Executor) JobList(ctx context.Context, params *riverdriver.JobListParam
 	return sliceutil.MapError(jobs, jobRowFromInternal)
 }
 
+// JobRenewLeaseMany renews unexpired leases matching the original claim snapshot.
+func (e *Executor) JobRenewLeaseMany(ctx context.Context, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
+	if len(params.IDs) != len(params.AttemptedAt) || len(params.IDs) != len(params.Attempts) || params.LeaseDuration <= 0 {
+		return nil, errors.New("lease renewal requires matching IDs, attempt times, and attempts and a positive duration")
+	}
+	jobs, err := dbsqlc.New().JobRenewLeaseMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobRenewLeaseManyParams{
+		IDs:           params.IDs,
+		AttemptedAt:   params.AttemptedAt,
+		Attempts:      sliceutil.Map(params.Attempts, func(attempt int) int64 { return int64(attempt) }),
+		LeaseDuration: params.LeaseDuration.Seconds(),
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowsFromInternalPartial(jobs), nil
+}
+
 func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
 	err := dbsqlc.New().JobRescueMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobRescueManyParams{
-		ID:           params.ID,
-		Error:        params.Error,
-		FinalizedAt:  sliceutil.Map(params.FinalizedAt, func(t *time.Time) time.Time { return ptrutil.ValOrDefault(t, time.Time{}) }),
-		ScheduledAt:  params.ScheduledAt,
-		State:        params.State,
-		StuckHorizon: params.StuckHorizon,
+		ID:               params.ID,
+		Error:            params.Error,
+		FinalizedAt:      sliceutil.Map(params.FinalizedAt, func(t *time.Time) time.Time { return ptrutil.ValOrDefault(t, time.Time{}) }),
+		LeaseExpiresAt:   sliceutil.Map(params.LeaseExpiresAt, func(t *time.Time) time.Time { return ptrutil.ValOrDefault(t, time.Time{}) }),
+		LeaseGracePeriod: params.LeaseGracePeriod.Seconds(),
+		ScheduledAt:      params.ScheduledAt,
+		State:            params.State,
+		StuckHorizon:     params.StuckHorizon,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -1564,6 +1585,7 @@ func jobRowFromInternalPartial(internal *dbsqlc.RiverJob) (*rivertype.JobRow, er
 		Errors:                      errors,
 		FinalizedAt:                 finalizedAt,
 		Kind:                        internal.Kind,
+		LeaseExpiresAt:              internal.LeaseExpiresAt,
 		MaxAttempts:                 max(int(internal.MaxAttempts), 0),
 		Metadata:                    internal.Metadata,
 		Priority:                    max(int(internal.Priority), 0),

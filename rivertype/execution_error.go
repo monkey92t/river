@@ -8,6 +8,10 @@ import (
 
 var ErrJobCancelledRemotely = JobCancel(errors.New("job cancelled remotely"))
 
+// ErrJobLeaseLost means the execution abandoned its unconfirmed lease. It must
+// not submit a result; the expired database lease is left for the rescuer.
+var ErrJobLeaseLost = errors.New("job lease lost")
+
 // JobCancel wraps err and can be returned from a Worker's Work method to cancel
 // the job at the end of execution. Regardless of whether or not the job has any
 // remaining attempts, this will ensure the job does not execute again.

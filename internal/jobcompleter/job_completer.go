@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/jobstats"
 	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
@@ -160,6 +161,9 @@ func (c *InlineCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobst
 	if err != nil {
 		return err
 	}
+	if !joblease.FromContext(ctx).Finish() {
+		return rivertype.ErrJobLeaseLost
+	}
 
 	// The driver intentionally returns 0 rows when a job is deleted while the
 	// completer is finalizing it (see UnknownJobIgnored shared driver test).
@@ -273,6 +277,9 @@ func (c *AsyncCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobsta
 		if err != nil {
 			return err
 		}
+		if !joblease.FromContext(ctx).Finish() {
+			return rivertype.ErrJobLeaseLost
+		}
 
 		// The driver intentionally returns 0 rows when a job is deleted while the
 		// completer is finalizing it (see UnknownJobIgnored shared driver test).
@@ -321,6 +328,7 @@ func (c *AsyncCompleter) Start(ctx context.Context) error {
 }
 
 type batchCompleterSetState struct {
+	Guard     *joblease.Guard
 	Params    *riverdriver.JobSetStateIfRunningParams
 	StartTime time.Time
 	Stats     *jobstats.JobStatistics
@@ -468,33 +476,99 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 	if len(setStateBatch) < 1 {
 		return nil
 	}
+	for id, state := range setStateBatch {
+		if state.Guard.Check() != nil {
+			delete(setStateBatch, id)
+		}
+	}
+	if len(setStateBatch) == 0 {
+		c.releaseBacklogWaitIfReady(ctx)
+		return nil
+	}
 
+	var events []CompleterJobUpdated
+	confirmed := make(map[int64]bool, len(setStateBatch))
+	flushEvents := func() {
+		if len(events) > 0 {
+			c.subscribeCh <- events
+		}
+	}
 	handleBatchError := func(err error) error {
-		if isNonRetryableCompleterError(err) {
+		// Confirmed sub-batches must still publish if a later sub-batch fails.
+		flushEvents()
+		if isNonRetryableCompleterError(err) && !errors.Is(err, rivertype.ErrJobLeaseLost) {
 			c.releaseBacklogWaitIfReady(ctx)
 			return err
 		}
 
+		for id := range confirmed {
+			delete(setStateBatch, id)
+		}
 		c.requeueBatch(ctx, setStateBatch)
 		return err
 	}
 
 	// Complete a sub-batch with retries. Also helps reduce visual noise and
 	// increase readability of loop below.
-	completeSubBatch := func(batchParams *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
+	completeSubBatch := func(batchParams *riverdriver.JobSetStateIfRunningManyParams) error {
 		start := time.Now()
 		defer func() {
 			c.Logger.DebugContext(ctx, c.Name+": Completed sub-batch of job(s)", "duration", time.Since(start), "num_jobs", len(batchParams.ID))
 		}()
 
-		return withRetries(ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
+		jobRows, err := withRetries(ctx, &c.BaseService, c.disableSleep, func(ctx context.Context) ([]*rivertype.JobRow, error) {
+			// Each sub-batch attempt rechecks admission. Cancelling one expired
+			// member cancels the shared request; live members can be requeued.
+			ctx, cancel := context.WithCancelCause(ctx)
+			defer cancel(context.Canceled)
+			for _, id := range batchParams.ID {
+				guard := setStateBatch[id].Guard
+				if guard == nil {
+					continue
+				}
+				requestCtx, cleanup, err := guard.Begin(ctx)
+				if err != nil {
+					return nil, rivertype.ErrJobLeaseLost
+				}
+				defer cleanup()
+				stop := context.AfterFunc(requestCtx, func() { cancel(context.Cause(requestCtx)) })
+				defer stop()
+			}
 			rows, err := c.pilot.JobSetStateIfRunningMany(ctx, c.exec, batchParams)
 			if err != nil {
+				for _, id := range batchParams.ID {
+					if setStateBatch[id].Guard.Check() != nil {
+						return nil, rivertype.ErrJobLeaseLost
+					}
+				}
 				return nil, err
 			}
-
 			return rows, nil
 		})
+		if err != nil {
+			return err
+		}
+
+		// Retain confirmed events even if a later sub-batch fails, while
+		// preserving one event batch for a normally completed full batch.
+		for _, id := range batchParams.ID {
+			confirmed[id] = setStateBatch[id].Guard.Finish()
+		}
+		completeTime := c.Time.Now()
+		if events == nil {
+			events = make([]CompleterJobUpdated, 0, len(setStateBatch))
+		}
+		for _, jobRow := range jobRows {
+			if !confirmed[jobRow.ID] {
+				continue
+			}
+			setState := setStateBatch[jobRow.ID]
+			setState.Stats.CompleteDuration = completeTime.Sub(setState.StartTime)
+			if update, ok := completerJobUpdated(ctx, &c.BaseService, jobRow, setState.Stats, setState.Params.Reason); ok {
+				events = append(events, update)
+			}
+		}
+		return nil
 	}
 
 	// This could be written more simply using multiple map helpers, but it's
@@ -531,13 +605,9 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 	// All the code below is concerned with doing that, with a fast loop that
 	// doesn't allocate any additional memory in case the entire batch is
 	// smaller than the sub-batch maximum size (which will be the common case).
-	var (
-		params  = mapBatch(setStateBatch)
-		jobRows []*rivertype.JobRow
-	)
+	params := mapBatch(setStateBatch)
 	c.Logger.DebugContext(ctx, c.Name+": Completing batch of job(s)", "num_jobs", len(setStateBatch))
 	if len(setStateBatch) > c.completionMaxSize {
-		jobRows = make([]*rivertype.JobRow, 0, len(setStateBatch))
 		for i := 0; i < len(setStateBatch); i += c.completionMaxSize {
 			endIndex := min(i+c.completionMaxSize, len(params.ID)) // beginning of next sub-batch or end of slice
 			subBatch := &riverdriver.JobSetStateIfRunningManyParams{
@@ -551,35 +621,16 @@ func (c *BatchCompleter) handleBatch(ctx context.Context) error {
 				Schema:          params.Schema,
 				State:           params.State[i:endIndex],
 			}
-			jobRowsSubBatch, err := completeSubBatch(subBatch)
-			if err != nil {
+			if err := completeSubBatch(subBatch); err != nil {
 				return handleBatchError(err)
 			}
-			jobRows = append(jobRows, jobRowsSubBatch...)
 		}
 	} else {
-		var err error
-		jobRows, err = completeSubBatch(params)
-		if err != nil {
+		if err := completeSubBatch(params); err != nil {
 			return handleBatchError(err)
 		}
 	}
-
-	var (
-		completeTime = c.Time.Now()
-		events       = make([]CompleterJobUpdated, 0, len(jobRows))
-	)
-	for _, jobRow := range jobRows {
-		setState := setStateBatch[jobRow.ID]
-		setState.Stats.CompleteDuration = completeTime.Sub(setState.StartTime)
-		if update, ok := completerJobUpdated(ctx, &c.BaseService, jobRow, setState.Stats, setState.Params.Reason); ok {
-			events = append(events, update)
-		}
-	}
-
-	if len(events) > 0 {
-		c.subscribeCh <- events
-	}
+	flushEvents()
 
 	func() {
 		c.setStateParamsMu.Lock()
@@ -609,6 +660,9 @@ func (c *BatchCompleter) releaseBacklogWaitIfReady(ctx context.Context) {
 func (c *BatchCompleter) requeueBatch(ctx context.Context, setStateBatch map[int64]batchCompleterSetState) {
 	c.setStateParamsMu.Lock()
 	for id, setState := range setStateBatch {
+		if setState.Guard.Check() != nil {
+			continue
+		}
 		if _, exists := c.setStateParams[id]; exists {
 			continue
 		}
@@ -634,13 +688,21 @@ func (c *BatchCompleter) JobSetStateIfRunning(ctx context.Context, stats *jobsta
 
 	var backlogSize int
 	for {
+		guard := joblease.FromContext(ctx)
+		if err := guard.Check(); err != nil {
+			return err
+		}
 		// Keep the common enqueue path to one lock acquisition. If the
 		// completer is behind, wait for the current backlog gate to open and
 		// retry so the threshold is checked against fresh state.
 		var waitChan <-chan struct{}
 		backlogSize, waitChan = c.tryEnqueueSetState(ctx, now, stats, params)
 		if waitChan != nil {
-			<-waitChan
+			select {
+			case <-waitChan:
+			case <-guard.Done():
+				return guard.Check()
+			}
 			continue
 		}
 		break
@@ -670,7 +732,10 @@ func (c *BatchCompleter) tryEnqueueSetState(ctx context.Context, now time.Time, 
 	}
 
 	statsSnapshot := *stats
-	c.setStateParams[params.ID] = batchCompleterSetState{Params: params, StartTime: now, Stats: &statsSnapshot}
+	guard := joblease.FromContext(ctx)
+	if guard.Check() == nil {
+		c.setStateParams[params.ID] = batchCompleterSetState{Guard: guard, Params: params, StartTime: now, Stats: &statsSnapshot}
+	}
 
 	return len(c.setStateParams), nil
 }
@@ -729,7 +794,7 @@ func (c *BatchCompleter) initBacklogWaitLocked(ctx context.Context, backlogSize,
 }
 
 func isNonRetryableCompleterError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, riverdriver.ErrClosedPool)
+	return errors.Is(err, context.Canceled) || errors.Is(err, rivertype.ErrJobLeaseLost) || errors.Is(err, riverdriver.ErrClosedPool)
 }
 
 // As configured, total time asleep from initial attempt is ~7 seconds (1 + 2 +
@@ -746,9 +811,18 @@ func withRetries[T any](logCtx context.Context, baseService *baseservice.BaseSer
 	)
 
 	for attempt := 1; attempt <= numRetries; attempt++ {
+		guard := joblease.FromContext(logCtx)
+		requestCtx, cleanup, err := guard.Begin(uncancelledCtx)
+		if err != nil {
+			return defaultVal, err
+		}
 		// I've found that we want at least ten seconds for a large batch,
 		// although it usually doesn't need that long.
-		retVal, err := timeoututil.WithTimeoutV(uncancelledCtx, rivercommon.HotOperationTimeout, baseService.Name+".withRetries", retryFunc)
+		retVal, err := timeoututil.WithTimeoutV(requestCtx, rivercommon.HotOperationTimeout, baseService.Name+".withRetries", retryFunc)
+		cleanup()
+		if leaseErr := guard.Check(); leaseErr != nil {
+			return defaultVal, leaseErr
+		}
 		if err != nil {
 			// A cancelled context or a closed pool will never succeed.
 			if isNonRetryableCompleterError(err) {

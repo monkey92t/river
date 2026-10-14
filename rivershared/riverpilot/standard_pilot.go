@@ -43,6 +43,11 @@ func (p *StandardPilot) JobInsertMany(
 	return execTx.JobInsertFastMany(ctx, params)
 }
 
+// JobRenewLeaseMany renews only the running leases still held by this client.
+func (p *StandardPilot) JobRenewLeaseMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
+	return exec.JobRenewLeaseMany(ctx, params)
+}
+
 func (p *StandardPilot) JobRescueMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
 	return exec.JobRescueMany(ctx, params)
 }

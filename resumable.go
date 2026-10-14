@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/riverplugin"
 )
 
@@ -22,6 +23,9 @@ var (
 // cursor immediately as part of a transaction, guaranteeing that it's stored
 // durably.
 func ResumableSetCursor[TCursor any](ctx context.Context, cursor TCursor) error {
+	if err := joblease.FromContext(ctx).Check(); err != nil {
+		return err
+	}
 	state := mustResumableState(ctx)
 	if state.StepName == "" {
 		return errResumableCursorNotInStep
@@ -56,6 +60,10 @@ type StepOpts struct{}
 // opts may be nil.
 func ResumableStep(ctx context.Context, name string, opts *StepOpts, stepFunc func(ctx context.Context) error) {
 	state := mustResumableState(ctx)
+	if err := joblease.FromContext(ctx).Check(); err != nil {
+		state.Err = err
+		return
+	}
 	if state.Err != nil {
 		return
 	}
@@ -106,6 +114,10 @@ func ResumableStep(ctx context.Context, name string, opts *StepOpts, stepFunc fu
 // opts may be nil.
 func ResumableStepCursor[TCursor any](ctx context.Context, name string, opts *StepOpts, stepFunc func(ctx context.Context, cursor TCursor) error) {
 	state := mustResumableState(ctx)
+	if err := joblease.FromContext(ctx).Check(); err != nil {
+		state.Err = err
+		return
+	}
 	if state.Err != nil {
 		return
 	}

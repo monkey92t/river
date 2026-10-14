@@ -10,6 +10,10 @@ import (
 // ErrJobCancelledRemotely is a sentinel error indicating that the job was cancelled remotely.
 var ErrJobCancelledRemotely = rivertype.ErrJobCancelledRemotely
 
+// ErrJobLeaseLost indicates that an execution abandoned its lease. Work must
+// stop when its context is cancelled with this cause; its result is discarded.
+var ErrJobLeaseLost = rivertype.ErrJobLeaseLost
+
 // JobCancelError is the error type returned by JobCancel. It should not be
 // initialized directly, but is returned from the [JobCancel] function and can
 // be used for test assertions.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/riverqueue/river/internal/jobexecutor"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/rivertype"
 )
 
@@ -41,7 +42,7 @@ const (
 // when the job's row is updated.
 //
 // Once recorded, the output is stored regardless of the outcome of the
-// execution attempt (success, error, panic, etc.).
+// execution attempt (success, error, panic, etc.), unless its lease was lost.
 //
 // RecordOutput always stores output lazily as a job is being completed (whether
 // that's completion to success or failure). Client.JobUpdate and JobUpdateTx
@@ -51,6 +52,9 @@ const (
 // The output is marshalled to JSON as part of this function and it will return
 // an error if the output is not JSON-encodable.
 func RecordOutput(ctx context.Context, output any) error {
+	if err := joblease.FromContext(ctx).Check(); err != nil {
+		return err
+	}
 	metadataUpdates, hasMetadataUpdates := jobexecutor.MetadataUpdatesFromWorkContext(ctx)
 	if !hasMetadataUpdates {
 		return errors.New("RecordOutput must be called within a Worker")

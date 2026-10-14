@@ -19,6 +19,7 @@ CREATE TABLE river_job (
     errors jsonb[],
     finalized_at timestamptz,
     kind text NOT NULL,
+    lease_expires_at timestamptz,
     max_attempts smallint NOT NULL DEFAULT 25,
     metadata jsonb NOT NULL DEFAULT '{}',
     priority smallint NOT NULL DEFAULT 1,
@@ -270,6 +271,7 @@ UPDATE
     /* TEMPLATE: schema */river_job
 SET
     state = 'running',
+    lease_expires_at = CASE WHEN @lease_duration::double precision > 0 THEN clock_timestamp() + make_interval(secs => @lease_duration::double precision) END,
     attempt = river_job.attempt + 1,
     attempted_at = coalesce(sqlc.narg('now')::timestamptz, now()),
     attempted_by = array_append(
@@ -318,7 +320,10 @@ SELECT *
 FROM /* TEMPLATE: schema */river_job
 WHERE state = 'running'
     AND id > @after_id::bigint
-    AND attempted_at < @stuck_horizon::timestamptz
+    AND (
+        (lease_expires_at IS NULL AND attempted_at < @stuck_horizon::timestamptz)
+        OR lease_expires_at <= statement_timestamp() - make_interval(secs => @lease_grace_period::double precision)
+    )
 ORDER BY id
 LIMIT @max;
 
@@ -537,6 +542,34 @@ WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
 LIMIT @max::int;
 
+-- Match the unchanged claim snapshot so a renewal can be retried when its
+-- response is lost. Lock before sampling time to prevent expired lease revival.
+-- name: JobRenewLeaseMany :many
+WITH lease_input AS (
+    SELECT unnest(@ids::bigint[]) AS id,
+        unnest(@attempted_at::timestamptz[]) AS attempted_at,
+        unnest(@attempts::bigint[]) AS attempt
+), locked_jobs AS (
+    SELECT river_job.id
+    FROM /* TEMPLATE: schema */river_job
+    JOIN lease_input ON river_job.id = lease_input.id
+    WHERE river_job.state = 'running'
+        AND river_job.attempted_at = lease_input.attempted_at
+        AND river_job.attempt = lease_input.attempt
+    ORDER BY river_job.id
+    FOR UPDATE OF river_job SKIP LOCKED
+)
+UPDATE /* TEMPLATE: schema */river_job
+SET lease_expires_at = clock_timestamp() + make_interval(secs => @lease_duration::double precision)
+FROM locked_jobs, lease_input
+WHERE river_job.id = locked_jobs.id
+    AND river_job.id = lease_input.id
+    AND river_job.state = 'running'
+    AND river_job.attempted_at = lease_input.attempted_at
+    AND river_job.attempt = lease_input.attempt
+    AND river_job.lease_expires_at > clock_timestamp()
+RETURNING river_job.*;
+
 -- Run by the rescuer to queue for retry or discard depending on job state.
 -- name: JobRescueMany :exec
 UPDATE /* TEMPLATE: schema */river_job
@@ -554,18 +587,25 @@ SET
             0
         ) + 1
     ),
-    state = updated_job.state
+    state = updated_job.state,
+    lease_expires_at = NULL
 FROM (
     SELECT
         unnest(@id::bigint[]) AS id,
         unnest(@error::jsonb[]) AS error,
         nullif(unnest(@finalized_at::timestamptz[]), '0001-01-01 00:00:00 +0000') AS finalized_at,
+        nullif(unnest(@lease_expires_at::timestamptz[]), '0001-01-01 00:00:00 +0000') AS lease_expires_at,
         unnest(@scheduled_at::timestamptz[]) AS scheduled_at,
         unnest(@state::text[])::/* TEMPLATE: schema */river_job_state AS state
 ) AS updated_job
 WHERE river_job.id = updated_job.id
     AND river_job.state = 'running'
-    AND river_job.attempted_at < @stuck_horizon::timestamptz;
+    AND (
+        (updated_job.lease_expires_at IS NULL AND river_job.lease_expires_at IS NULL
+            AND river_job.attempted_at < @stuck_horizon::timestamptz)
+        OR (river_job.lease_expires_at = updated_job.lease_expires_at
+            AND river_job.lease_expires_at <= clock_timestamp() - make_interval(secs => @lease_grace_period::double precision))
+    );
 
 -- name: JobRetry :one
 WITH job_to_update AS (
@@ -707,6 +747,7 @@ WITH job_input AS (
 updated AS (
     UPDATE /* TEMPLATE: schema */river_job
     SET
+        lease_expires_at = CASE WHEN job_input.state = 'running' THEN river_job.lease_expires_at END,
         attempt = CASE
             WHEN river_job.state = 'running'
                  AND NOT (job_input.state IN ('available','retryable','scheduled') AND river_job.metadata ? 'cancel_attempted_at')
@@ -792,6 +833,7 @@ SET
     attempted_by = CASE WHEN @attempted_by_do_update::boolean THEN @attempted_by ELSE attempted_by END,
     errors = CASE WHEN @errors_do_update::boolean THEN @errors::jsonb[] ELSE errors END,
     finalized_at = CASE WHEN @finalized_at_do_update::boolean THEN @finalized_at ELSE finalized_at END,
+    lease_expires_at = CASE WHEN @state_do_update::boolean AND @state::/* TEMPLATE: schema */river_job_state != 'running' THEN NULL ELSE lease_expires_at END,
     max_attempts = CASE WHEN @max_attempts_do_update::boolean THEN @max_attempts ELSE max_attempts END,
     metadata = CASE WHEN @metadata_do_update::boolean THEN @metadata::jsonb ELSE metadata END,
     state = CASE WHEN @state_do_update::boolean THEN @state::/* TEMPLATE: schema */river_job_state ELSE state END

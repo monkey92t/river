@@ -185,6 +185,7 @@ func TestJobRescuer(t *testing.T) {
 
 		require.Equal(t, JobRescuerRescueAfterDefault, cleaner.Config.RescueAfter)
 		require.Equal(t, JobRescuerIntervalDefault, cleaner.Config.Interval)
+		require.Equal(t, JobRescuerLeaseGracePeriodDefault, cleaner.Config.LeaseGracePeriod)
 	})
 
 	t.Run("StartStopStress", func(t *testing.T) {
@@ -589,5 +590,180 @@ func TestJobRescuer(t *testing.T) {
 				require.Equal(t, riversharedmaintenance.BatchSizeDefault, rescuer.batchSize())
 			}
 		}
+	})
+}
+
+// TestJobRescuer_Lease verifies that lease expiry replaces execution age only for
+// leased jobs, while rescue retains the existing retry and cancellation policy.
+func TestJobRescuer_Lease(t *testing.T) {
+	t.Parallel()
+
+	type testBundle struct {
+		exec    riverdriver.Executor
+		rescuer *JobRescuer
+	}
+
+	setup := func(t *testing.T) *testBundle {
+		t.Helper()
+
+		exec := riverpgxv5.New(nil).UnwrapExecutor(riverdbtest.TestTxPgx(context.Background(), t))
+		rescuer := NewRescuer(riversharedtest.BaseServiceArchetype(t), &JobRescuerConfig{
+			ClientRetryPolicy: &SimpleClientRetryPolicy{},
+			WorkUnitFactoryFunc: func(kind string) workunit.WorkUnitFactory {
+				timeout := time.Duration(0)
+				switch kind {
+				case "long_timeout":
+					timeout = 10 * time.Hour
+				case "no_timeout":
+					timeout = -1
+				}
+				return &callbackWorkUnitFactory{timeout: timeout}
+			},
+		}, exec)
+		return &testBundle{exec: exec, rescuer: rescuer}
+	}
+
+	// Test fixtures use raw SQL to assign an expiry without introducing a
+	// production API that allows arbitrary modification of a running lease.
+	insertLeaseJobFunc := func(t *testing.T, bundle *testBundle, opts *testfactory.JobOpts, expiresAt time.Time) *rivertype.JobRow {
+		t.Helper()
+
+		opts.State = new(rivertype.JobStateRunning)
+		job := testfactory.Job(context.Background(), t, bundle.exec, opts)
+		require.NoError(t, bundle.exec.Exec(context.Background(), "UPDATE river_job SET lease_expires_at = $1 WHERE id = $2", expiresAt, job.ID))
+		job, err := bundle.exec.JobGetByID(context.Background(), &riverdriver.JobGetByIDParams{ID: job.ID})
+		require.NoError(t, err)
+		return job
+	}
+
+	t.Run("ExpiredLeaseIgnoresBusinessTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		for _, kind := range []string{"default_timeout", "long_timeout", "no_timeout"} {
+			t.Run(kind, func(t *testing.T) {
+				t.Parallel()
+
+				bundle := setup(t)
+				bundle.rescuer.Config.ClientJobTimeout = -1
+				job := insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{Attempt: new(1), Kind: &kind, MaxAttempts: new(5)}, time.Now().Add(-2*time.Minute))
+				ctx := context.Background()
+
+				result, err := bundle.rescuer.runOnce(ctx)
+				require.NoError(t, err)
+				require.Equal(t, int64(1), result.NumJobsRetried)
+
+				jobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+				require.NoError(t, err)
+				require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+				require.Nil(t, jobAfter.LeaseExpiresAt)
+				require.Equal(t, job.Attempt, jobAfter.Attempt)
+				require.Len(t, jobAfter.Errors, 1)
+			})
+		}
+	})
+
+	t.Run("HealthyLeaseAndGracePeriodIgnoreExecutionAge", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+		bundle.rescuer.Config.LeaseGracePeriod = 5 * time.Minute
+		oldAttemptedAt := time.Now().Add(-24 * time.Hour)
+		jobs := []*rivertype.JobRow{
+			insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{AttemptedAt: &oldAttemptedAt}, time.Now().Add(time.Minute)),
+			insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{AttemptedAt: &oldAttemptedAt}, time.Now().Add(-2*time.Minute)),
+		}
+		ctx := context.Background()
+
+		result, err := bundle.rescuer.runOnce(ctx)
+		require.NoError(t, err)
+		require.Zero(t, result.NumJobsRetried)
+		require.Zero(t, result.NumJobsDiscarded)
+
+		for _, job := range jobs {
+			jobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
+			require.Equal(t, job.LeaseExpiresAt, jobAfter.LeaseExpiresAt)
+			require.Empty(t, jobAfter.Errors)
+		}
+	})
+
+	t.Run("PreservesCancellationAndAttemptLimit", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+		expiredAt := time.Now().Add(-2 * time.Minute)
+		cancelledJob := insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{
+			Attempt:     new(5),
+			Kind:        new("no_timeout"),
+			MaxAttempts: new(5),
+			Metadata:    fmt.Appendf(nil, `{"cancel_attempted_at": %q}`, time.Now().UTC().Format(time.RFC3339Nano)),
+		}, expiredAt)
+		discardedJob := insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{Attempt: new(5), Kind: new("no_timeout"), MaxAttempts: new(5)}, expiredAt)
+		ctx := context.Background()
+
+		result, err := bundle.rescuer.runOnce(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), result.NumJobsCancelled)
+		require.Equal(t, int64(1), result.NumJobsDiscarded)
+
+		for job, state := range map[*rivertype.JobRow]rivertype.JobState{
+			cancelledJob: rivertype.JobStateCancelled,
+			discardedJob: rivertype.JobStateDiscarded,
+		} {
+			jobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, state, jobAfter.State)
+			require.Nil(t, jobAfter.LeaseExpiresAt)
+			require.NotNil(t, jobAfter.FinalizedAt)
+			require.Equal(t, job.Attempt, jobAfter.Attempt)
+			require.Len(t, jobAfter.Errors, 1)
+		}
+	})
+
+	t.Run("RescuesLeasedJobsAfterLegacyBatch", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+		bundle.rescuer.Config.Default = 2
+		ctx := context.Background()
+		legacyJobs := make([]*rivertype.JobRow, bundle.rescuer.Config.Default)
+		for i := range legacyJobs {
+			legacyJobs[i] = testfactory.Job(ctx, t, bundle.exec, &testfactory.JobOpts{
+				AttemptedAt: new(time.Now().Add(-24 * time.Hour)),
+				Kind:        new("no_timeout"),
+				State:       new(rivertype.JobStateRunning),
+			})
+		}
+		leasedJob := insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{Kind: new("no_timeout")}, time.Now().Add(-2*time.Minute))
+
+		result, err := bundle.rescuer.runOnce(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), result.NumJobsRetried)
+
+		for _, job := range legacyJobs {
+			jobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, rivertype.JobStateRunning, jobAfter.State)
+		}
+		jobAfter, err := bundle.exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: leasedJob.ID})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateRetryable, jobAfter.State)
+	})
+
+	t.Run("UsesPilotLeaseSnapshot", func(t *testing.T) {
+		t.Parallel()
+
+		bundle := setup(t)
+		pilot := &jobRescuerPilotSpy{}
+		bundle.rescuer.Config.Pilot = pilot
+		bundle.rescuer.Config.LeaseGracePeriod = 90 * time.Second
+		job := insertLeaseJobFunc(t, bundle, &testfactory.JobOpts{}, time.Now().Add(-2*time.Minute))
+
+		_, err := bundle.rescuer.runOnce(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, bundle.rescuer.Config.LeaseGracePeriod, pilot.jobGetStuckParams.LeaseGracePeriod)
+		require.Equal(t, bundle.rescuer.Config.LeaseGracePeriod, pilot.jobRescueManyParams.LeaseGracePeriod)
+		require.Equal(t, []*time.Time{job.LeaseExpiresAt}, pilot.jobRescueManyParams.LeaseExpiresAt)
 	})
 }

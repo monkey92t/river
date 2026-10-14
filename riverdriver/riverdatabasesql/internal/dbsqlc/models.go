@@ -68,6 +68,7 @@ type RiverJob struct {
 	Errors                      []string
 	FinalizedAt                 *time.Time
 	Kind                        string
+	LeaseExpiresAt              *time.Time
 	MaxAttempts                 int16
 	Metadata                    string
 	Priority                    int16

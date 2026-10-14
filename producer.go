@@ -17,6 +17,7 @@ import (
 
 	"github.com/riverqueue/river/internal/jobcompleter"
 	"github.com/riverqueue/river/internal/jobexecutor"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/notifier"
 	"github.com/riverqueue/river/internal/pluginlookup"
 	"github.com/riverqueue/river/internal/retrypolicy"
@@ -90,6 +91,10 @@ type producerConfig struct {
 	// jobs. Typically new jobs will be picked up ~immediately after insert via
 	// LISTEN/NOTIFY, but this provides a fallback.
 	FetchPollInterval time.Duration
+
+	// JobLease and JobLeaseManager supervise executions acquired with a lease.
+	JobLease        *JobLeaseConfig
+	JobLeaseManager *joblease.Manager
 
 	PluginLookupByJob  *pluginlookup.JobPluginLookup
 	PluginLookupGlobal *pluginlookup.PluginLookup
@@ -226,7 +231,7 @@ type producer struct {
 
 	// Receives completed jobs from workers. Written by completed workers, only
 	// read from main goroutine.
-	jobResultCh chan *rivertype.JobRow
+	jobResultCh chan *jobexecutor.JobExecutor
 
 	jobTimeout time.Duration
 
@@ -264,7 +269,7 @@ func newProducer(archetype *baseservice.Archetype, exec riverdriver.Executor, pi
 		config:         config.mustValidate(),
 		exec:           exec,
 		errorHandler:   errorHandler,
-		jobResultCh:    make(chan *rivertype.JobRow, config.MaxWorkers),
+		jobResultCh:    make(chan *jobexecutor.JobExecutor, config.MaxWorkers),
 		jobTimeout:     config.JobTimeout,
 		pilot:          pilot,
 		queueControlCh: make(chan *controlEventPayload, 100),
@@ -687,7 +692,7 @@ func (p *producer) innerFetchLoop(workCtx context.Context, fetchResultCh chan pr
 			if result.err != nil {
 				p.Logger.ErrorContext(workCtx, p.Name+": Error fetching jobs", slog.String("err", result.err.Error()), slog.String("queue", p.config.Queue))
 			} else if numLocked := len(result.jobs); numLocked > 0 {
-				p.startNewExecutors(workCtx, result.jobs, result.decodeErrors, pendingCancelJobs)
+				p.startNewExecutors(workCtx, result.jobs, result.decodeErrors, pendingCancelJobs, result.sentAt)
 
 				if numLocked == limit {
 					// Fetch returned the maximum number of jobs that were requested,
@@ -717,6 +722,11 @@ func (p *producer) executorShutdownLoop(ctx context.Context) {
 		p.activeJobsMu.Lock()
 		numActiveJobs := len(p.activeJobs)
 		p.activeJobsMu.Unlock()
+		if p.config.JobLease != nil {
+			// Leased jobs retain their slots until physical execution ends.
+			// A replaced same-ID entry must not hide an older goroutine.
+			numActiveJobs = int(p.numJobsActive.Load())
+		}
 		if numActiveJobs == 0 {
 			return
 		}
@@ -787,12 +797,14 @@ func (p *producer) addActiveJob(id int64, executor *jobexecutor.JobExecutor) {
 	p.activeJobsMu.Unlock()
 }
 
-func (p *producer) removeActiveJob(job *rivertype.JobRow) {
+func (p *producer) removeActiveJob(executor *jobexecutor.JobExecutor) {
+	job := executor.JobRow
 	p.activeJobsMu.Lock()
-	executor := p.activeJobs[job.ID]
-	delete(p.activeJobs, job.ID)
+	if p.activeJobs[job.ID] == executor {
+		delete(p.activeJobs, job.ID)
+	}
 	p.activeJobsMu.Unlock()
-	if executor == nil || executor.TryCloseSlot() {
+	if executor.TryCloseSlot() {
 		p.numJobsActive.Add(-1)
 	}
 	p.numJobsRan.Add(1)
@@ -813,7 +825,8 @@ func (p *producer) handleWorkerStuck(ctx context.Context, executor *jobexecutor.
 		Queue:          job.Queue,
 		TotalStuckJobs: totalStuckJobs,
 	})
-	if !result.AddWorkerSlot || !executor.TryCloseSlot() {
+	// Leased executions retain physical capacity until their goroutine exits.
+	if p.config.JobLease != nil || !result.AddWorkerSlot || !executor.TryCloseSlot() {
 		return
 	}
 
@@ -861,7 +874,7 @@ func (p *producer) metricEmitHooksFromLookup() []rivertype.HookMetricEmit {
 func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultCh chan<- producerFetchResult) {
 	// When a queue is paused, innerFetchLoop dispatches with count zero so it can
 	// continue servicing state changes without attempting to lock jobs or emit metrics.
-	if count <= 0 {
+	if count <= 0 || !p.config.JobLeaseManager.CanFetch() {
 		fetchResultCh <- producerFetchResult{}
 		return
 	}
@@ -884,8 +897,14 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		startedAt = time.Now()
 	}
 
+	var leaseDuration time.Duration
+	if p.config.JobLease != nil {
+		leaseDuration = p.config.JobLease.LeaseDuration
+	}
+	sentAt := time.Now()
 	res, err := p.pilot.JobGetAvailable(ctx, p.exec, p.state, &riverdriver.JobGetAvailableParams{
 		ClientID:       p.config.ClientID,
+		LeaseDuration:  leaseDuration,
 		Kind:           p.fetchKind,
 		MaxAttemptedBy: maxAttemptedBy,
 		MaxToLock:      count,
@@ -917,7 +936,7 @@ func (p *producer) dispatchWork(workCtx context.Context, count int, fetchResultC
 		})
 	}
 
-	fetchResultCh <- producerFetchResult{decodeErrors: res.DecodeErrors, jobs: res.Jobs}
+	fetchResultCh <- producerFetchResult{decodeErrors: res.DecodeErrors, jobs: res.Jobs, sentAt: sentAt}
 }
 
 func (p *producer) emitMetric(ctx context.Context, params *rivertype.HookMetricEmitParams) {
@@ -966,7 +985,7 @@ func (p *producer) heartbeatLogLoop(ctx context.Context, wg *sync.WaitGroup) {
 // couldn't be decoded isn't worked, but it still gets an executor that fails
 // its attempt with the decode error, so that it's retried or discarded
 // through the normal error handling path instead of being left running.
-func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.JobRow, decodeErrors map[int64]error, pendingCancelJobs map[int64]struct{}) {
+func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.JobRow, decodeErrors map[int64]error, pendingCancelJobs map[int64]struct{}, sentAt time.Time) {
 	defaultClientRetryPolicy := retrypolicy.NewDefault(p.Time)
 
 	for _, job := range jobs {
@@ -980,6 +999,10 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 
 		// jobCancel will always be called by the executor to prevent leaks.
 		jobCtx, jobCancel := context.WithCancelCause(workCtx)
+		if p.config.JobLeaseManager != nil {
+			guard := p.config.JobLeaseManager.Register(job, sentAt, jobCancel)
+			jobCtx = joblease.WithGuard(jobCtx, guard)
+		}
 
 		var executor *jobexecutor.JobExecutor
 		executor = baseservice.Init(&p.Archetype, &jobexecutor.JobExecutor{
@@ -998,7 +1021,7 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 				Stuck   func(ctx context.Context, jobRow *rivertype.JobRow)
 				Unstuck func()
 			}{
-				JobDone: p.handleWorkerDone,
+				JobDone: func(_ *rivertype.JobRow) { p.jobResultCh <- executor },
 				Stuck:   func(ctx context.Context, jobRow *rivertype.JobRow) { p.handleWorkerStuck(ctx, executor, jobRow) },
 				Unstuck: p.handleWorkerUnstuck,
 			},
@@ -1006,6 +1029,10 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 			StuckThresholdOverride: p.config.JobStuckThreshold,
 			WorkUnit:               workUnit,
 		})
+		if p.config.JobLease != nil {
+			executor.LeaseCancelGracePeriod = p.config.JobLease.CancelGracePeriod
+			executor.LeaseFinalizeTimeout = p.config.JobLease.FinalizeTimeout
+		}
 		p.addActiveJob(job.ID, executor)
 		if _, ok := pendingCancelJobs[job.ID]; ok {
 			// Cancel before execution so the worker starts with a cancelled context.
@@ -1022,10 +1049,6 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 
 func (p *producer) maxJobsToFetch() int {
 	return p.config.MaxWorkers - int(p.numJobsActive.Load())
-}
-
-func (p *producer) handleWorkerDone(job *rivertype.JobRow) {
-	p.jobResultCh <- job
 }
 
 // Cancellation polling is independent of fetching: saturated and paused producers
@@ -1237,6 +1260,7 @@ type producerFetchResult struct {
 	decodeErrors map[int64]error
 	err          error
 	jobs         []*rivertype.JobRow
+	sentAt       time.Time
 }
 
 type errorHandlerAdapter struct {

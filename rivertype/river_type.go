@@ -86,6 +86,9 @@ type JobRow struct {
 	// `JobArgs`.
 	Kind string
 
+	// LeaseExpiresAt is the active execution lease expiry, or nil for legacy jobs.
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+
 	// MaxAttempts is the maximum number of attempts that the job will be tried
 	// before it errors for the last time and will no longer be worked.
 	//

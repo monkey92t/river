@@ -7,6 +7,7 @@ import (
 
 	"github.com/riverqueue/river/internal/execution"
 	"github.com/riverqueue/river/internal/jobexecutor"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
@@ -52,6 +53,14 @@ func ResumableSetStepCursorTx[TDriver riverdriver.Driver[TTx], TTx any, TArgs Jo
 }
 
 func resumableSetStepTx[TTx any, TArgs JobArgs](ctx context.Context, tx TTx, job *Job[TArgs], cursor json.RawMessage) (*Job[TArgs], error) {
+	if job.LeaseExpiresAt != nil && joblease.FromContext(ctx) == nil {
+		return nil, ErrJobLeaseLost
+	}
+	ctx, release, err := joblease.FromContext(ctx).Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if job.State != rivertype.JobStateRunning {
 		return nil, errors.New("job must be running")
 	}

@@ -28,5 +28,7 @@ type JobStuckHandlerResult struct {
 	// occupying a worker slot so another job can begin executing. This can be
 	// dangerous because the stuck job's goroutine is still running, so the
 	// queue may temporarily have more active job goroutines than MaxWorkers.
+	// Ignored when JobLease is enabled: a leased execution retains its slot
+	// until Work actually returns, avoiding unbounded overlapping goroutines.
 	AddWorkerSlot bool
 }

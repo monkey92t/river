@@ -42,6 +42,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	exerciseSchemaIntrospection(ctx, t, driverWithSchema, executorWithTx)
 	exerciseSchemaName(ctx, t, driverWithSchema)
 	exerciseJobInsert(ctx, t, driverWithSchema, executorWithTx)
+	exerciseJobLease(ctx, t, driverWithSchema, executorWithTx)
 	exerciseJobRead(ctx, t, executorWithTx)
 	exerciseJobUpdate(ctx, t, executorWithTx)
 	exerciseJobDelete(ctx, t, executorWithTx)

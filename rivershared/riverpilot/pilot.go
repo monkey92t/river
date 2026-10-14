@@ -101,6 +101,12 @@ func (p *PilotInitParams) Validate() *PilotInitParams {
 	return p
 }
 
+// PilotJobLease identifies pilots that preserve lease acquisition and completion
+// semantics and support renewal. Clients reject lease mode without this capability.
+type PilotJobLease interface {
+	JobRenewLeaseMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error)
+}
+
 // PilotJobRescuer contains optional Pilot functionality related to rescuing
 // stuck jobs. Pilots that don't implement it fall back to the standard
 // executor-backed behavior.

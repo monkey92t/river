@@ -25,7 +25,7 @@ SET
 WHERE id = ?3
     AND state NOT IN ('cancelled', 'completed', 'discarded')
     AND finalized_at IS NULL
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobCancelParams struct {
@@ -64,6 +64,7 @@ func (q *Queries) JobCancel(ctx context.Context, db DBTX, arg *JobCancelParams) 
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -180,7 +181,7 @@ FROM /* TEMPLATE: schema */river_job
 WHERE id = ?1
     -- Do not touch running jobs:
     AND river_job.state != 'running'
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 // Differs by necessity from other drivers because SQLite doesn't support
@@ -209,6 +210,7 @@ func (q *Queries) JobDelete(ctx context.Context, db DBTX, id int64) (*RiverJob, 
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -276,7 +278,7 @@ WHERE id IN (
     ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
     LIMIT ?1
 )
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 func (q *Queries) JobDeleteMany(ctx context.Context, db DBTX, max int64) ([]*RiverJob, error) {
@@ -307,6 +309,7 @@ func (q *Queries) JobDeleteMany(ctx context.Context, db DBTX, max int64) ([]*Riv
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -331,21 +334,22 @@ SET
     -- comments there for more details.
     attempted_by = /* TEMPLATE_BEGIN: attempted_by_clause */ attempted_by /* TEMPLATE_END */,
 
+    lease_expires_at = CASE WHEN cast(?2 AS real) > 0 THEN datetime('now', 'subsec', cast(?2 AS real) || ' seconds') END,
     state = 'running'
 WHERE id IN (
     SELECT id
     FROM /* TEMPLATE: schema */river_job
     WHERE
         priority >= 0
-        AND river_job.queue = ?2
-        AND (NOT cast(?3 AS boolean) OR kind IN (SELECT value FROM json_each(cast(?4 AS blob))))
+        AND river_job.queue = ?3
+        AND (NOT cast(?4 AS boolean) OR kind IN (SELECT value FROM json_each(cast(?5 AS blob))))
         AND scheduled_at <= coalesce(cast(?1 AS text), datetime('now', 'subsec'))
         AND state = 'available'
     ORDER BY
         priority ASC,
         scheduled_at ASC,
         id ASC
-    LIMIT ?5
+    LIMIT ?6
 )
 RETURNING
     id,
@@ -365,36 +369,39 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 `
 
 type JobGetAvailableParams struct {
-	Now        *string
-	Queue      string
-	KindFilter bool
-	Kind       []byte
-	MaxToLock  int64
+	Now           *string
+	LeaseDuration float64
+	Queue         string
+	KindFilter    bool
+	Kind          []byte
+	MaxToLock     int64
 }
 
 type JobGetAvailableRow struct {
-	ID           int64
-	Column2      []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	Column5      []byte
-	CreatedAt    time.Time
-	Column7      []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Column11     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Column16     []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // Differs from the Postgres version in that we don't have `FOR UPDATE SKIP
@@ -415,6 +422,7 @@ type JobGetAvailableRow struct {
 func (q *Queries) JobGetAvailable(ctx context.Context, db DBTX, arg *JobGetAvailableParams) ([]*JobGetAvailableRow, error) {
 	rows, err := db.QueryContext(ctx, jobGetAvailable,
 		arg.Now,
+		arg.LeaseDuration,
 		arg.Queue,
 		arg.KindFilter,
 		arg.Kind,
@@ -446,6 +454,7 @@ func (q *Queries) JobGetAvailable(ctx context.Context, db DBTX, arg *JobGetAvail
 			&i.Column16,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -461,7 +470,7 @@ func (q *Queries) JobGetAvailable(ctx context.Context, db DBTX, arg *JobGetAvail
 }
 
 const jobGetByID = `-- name: JobGetByID :one
-SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE id = ?1
 LIMIT 1
@@ -489,12 +498,13 @@ func (q *Queries) JobGetByID(ctx context.Context, db DBTX, id int64) (*RiverJob,
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
 
 const jobGetByIDMany = `-- name: JobGetByIDMany :many
-SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE id IN (/*SLICE:id*/?)
 ORDER BY id
@@ -538,6 +548,7 @@ func (q *Queries) JobGetByIDMany(ctx context.Context, db DBTX, id []int64) ([]*R
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -553,7 +564,7 @@ func (q *Queries) JobGetByIDMany(ctx context.Context, db DBTX, id []int64) ([]*R
 }
 
 const jobGetByKindMany = `-- name: JobGetByKindMany :many
-SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE kind IN (/*SLICE:kind*/?)
 ORDER BY id
@@ -597,6 +608,7 @@ func (q *Queries) JobGetByKindMany(ctx context.Context, db DBTX, kind []string) 
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -675,46 +687,57 @@ SELECT
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE state = 'running'
     AND id > ?1
-    AND attempted_at < cast(?2 AS text)
+    AND (
+        (lease_expires_at IS NULL AND attempted_at < cast(?2 AS text))
+        OR lease_expires_at <= datetime('now', 'subsec', -cast(?3 AS real) || ' seconds')
+    )
 ORDER BY id
-LIMIT ?3
+LIMIT ?4
 `
 
 type JobGetStuckParams struct {
-	AfterID      int64
-	StuckHorizon string
-	Max          int64
+	AfterID          int64
+	StuckHorizon     string
+	LeaseGracePeriod float64
+	Max              int64
 }
 
 type JobGetStuckRow struct {
-	ID           int64
-	Args         []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	AttemptedBy  []byte
-	CreatedAt    time.Time
-	Errors       []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Metadata     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Tags         []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Args           []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	AttemptedBy    []byte
+	CreatedAt      time.Time
+	Errors         []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Metadata       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Tags           []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // Lists columns out to tolerate values that aren't valid JSON. See
 // JobGetAvailable.
 func (q *Queries) JobGetStuck(ctx context.Context, db DBTX, arg *JobGetStuckParams) ([]*JobGetStuckRow, error) {
-	rows, err := db.QueryContext(ctx, jobGetStuck, arg.AfterID, arg.StuckHorizon, arg.Max)
+	rows, err := db.QueryContext(ctx, jobGetStuck,
+		arg.AfterID,
+		arg.StuckHorizon,
+		arg.LeaseGracePeriod,
+		arg.Max,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -741,6 +764,7 @@ func (q *Queries) JobGetStuck(ctx context.Context, db DBTX, arg *JobGetStuckPara
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -802,7 +826,7 @@ ON CONFLICT (unique_key)
     -- Something needs to be updated for a row to be returned on a conflict.
     -- Keep the existing kind, which may differ under ` + "`" + `ExcludeKind` + "`" + `.
     DO UPDATE SET kind = river_job.kind
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobInsertFastParams struct {
@@ -857,6 +881,7 @@ func (q *Queries) JobInsertFast(ctx context.Context, db DBTX, arg *JobInsertFast
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -910,7 +935,7 @@ ON CONFLICT (unique_key)
     -- Something needs to be updated for a row to be returned on a conflict.
     -- Keep the existing kind, which may differ under ` + "`" + `ExcludeKind` + "`" + `.
     DO UPDATE SET kind = river_job.kind
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 func (q *Queries) JobInsertFastMany(ctx context.Context, db DBTX, jobs []byte) ([]*RiverJob, error) {
@@ -941,6 +966,7 @@ func (q *Queries) JobInsertFastMany(ctx context.Context, db DBTX, jobs []byte) (
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1128,7 +1154,7 @@ INSERT INTO /* TEMPLATE: schema */river_job(
     jsonb(?15),
     CASE WHEN length(cast(?16 AS blob)) = 0 THEN NULL ELSE ?16 END,
     ?17
-) RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+) RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobInsertFullParams struct {
@@ -1191,6 +1217,7 @@ func (q *Queries) JobInsertFull(ctx context.Context, db DBTX, arg *JobInsertFull
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -1234,7 +1261,7 @@ SELECT
     CASE WHEN length(cast(json_extract(value, '$.unique_key') AS text)) = 0 THEN NULL ELSE unhex(cast(json_extract(value, '$.unique_key') AS text)) END,
     nullif(cast(json_extract(value, '$.unique_states') AS integer), 0)
 FROM json_each(cast(?1 AS blob))
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 func (q *Queries) JobInsertFullMany(ctx context.Context, db DBTX, jobs []byte) ([]*RiverJob, error) {
@@ -1265,6 +1292,7 @@ func (q *Queries) JobInsertFullMany(ctx context.Context, db DBTX, jobs []byte) (
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1333,7 +1361,7 @@ func (q *Queries) JobKindList(ctx context.Context, db DBTX, arg *JobKindListPara
 }
 
 const jobList = `-- name: JobList :many
-SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+SELECT id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
@@ -1368,6 +1396,112 @@ func (q *Queries) JobList(ctx context.Context, db DBTX, max int64) ([]*RiverJob,
 			&i.Tags,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const jobRenewLeaseMany = `-- name: JobRenewLeaseMany :many
+UPDATE /* TEMPLATE: schema */river_job
+SET lease_expires_at = datetime('now', 'subsec', cast(?1 AS real) || ' seconds')
+WHERE state = 'running'
+    AND lease_expires_at > datetime('now', 'subsec')
+    AND EXISTS (
+        SELECT 1 FROM json_each(cast(?2 AS blob)) AS lease
+        WHERE river_job.id = json_extract(lease.value, '$.id')
+            AND river_job.attempted_at = json_extract(lease.value, '$.attempted_at')
+            AND river_job.attempt = json_extract(lease.value, '$.attempt')
+    )
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states,
+    lease_expires_at
+`
+
+type JobRenewLeaseManyParams struct {
+	LeaseDuration float64
+	Leases        []byte
+}
+
+type JobRenewLeaseManyRow struct {
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
+}
+
+// Match the unchanged claim snapshot so unconfirmed renewals are retryable.
+// JSON input keeps this a single batch, and expired leases cannot be revived.
+func (q *Queries) JobRenewLeaseMany(ctx context.Context, db DBTX, arg *JobRenewLeaseManyParams) ([]*JobRenewLeaseManyRow, error) {
+	rows, err := db.QueryContext(ctx, jobRenewLeaseMany, arg.LeaseDuration, arg.Leases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*JobRenewLeaseManyRow
+	for rows.Next() {
+		var i JobRenewLeaseManyRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Column2,
+			&i.Attempt,
+			&i.AttemptedAt,
+			&i.Column5,
+			&i.CreatedAt,
+			&i.Column7,
+			&i.FinalizedAt,
+			&i.Kind,
+			&i.MaxAttempts,
+			&i.Column11,
+			&i.Priority,
+			&i.Queue,
+			&i.State,
+			&i.ScheduledAt,
+			&i.Column16,
+			&i.UniqueKey,
+			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1405,19 +1539,27 @@ SET
                             0
                         ) + 1
                     ) END,
+    lease_expires_at = NULL,
     state = ?4
 WHERE id = ?5
     AND state = 'running'
-    AND attempted_at < cast(?6 AS text)
+    AND (
+        (?6 IS NULL AND lease_expires_at IS NULL
+            AND attempted_at < cast(?7 AS text))
+        OR (lease_expires_at = cast(?6 AS text)
+            AND lease_expires_at <= datetime('now', 'subsec', -cast(?8 AS real) || ' seconds'))
+    )
 `
 
 type JobRescueParams struct {
-	Error        interface{}
-	FinalizedAt  *string
-	ScheduledAt  string
-	State        string
-	ID           int64
-	StuckHorizon string
+	Error            interface{}
+	FinalizedAt      *string
+	ScheduledAt      string
+	State            string
+	ID               int64
+	LeaseExpiresAt   interface{}
+	StuckHorizon     string
+	LeaseGracePeriod float64
 }
 
 // Rescue a job.
@@ -1441,7 +1583,9 @@ func (q *Queries) JobRescue(ctx context.Context, db DBTX, arg *JobRescueParams) 
 		arg.ScheduledAt,
 		arg.State,
 		arg.ID,
+		arg.LeaseExpiresAt,
 		arg.StuckHorizon,
+		arg.LeaseGracePeriod,
 	)
 	return err
 }
@@ -1465,7 +1609,7 @@ WHERE id = ?2
         state <> 'available'
         OR scheduled_at > coalesce(cast(?1 AS text), datetime('now', 'subsec'))
     )
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobRetryParams struct {
@@ -1504,6 +1648,7 @@ func (q *Queries) JobRetry(ctx context.Context, db DBTX, arg *JobRetryParams) (*
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -1610,28 +1755,30 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 `
 
 type JobScheduleSetAvailableRow struct {
-	ID           int64
-	Column2      []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	Column5      []byte
-	CreatedAt    time.Time
-	Column7      []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Column11     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Column16     []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // Columns are listed out to tolerate values that aren't valid JSON. See
@@ -1674,6 +1821,7 @@ func (q *Queries) JobScheduleSetAvailable(ctx context.Context, db DBTX, id []int
 			&i.Column16,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1714,7 +1862,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 `
 
 type JobScheduleSetDiscardedParams struct {
@@ -1723,24 +1872,25 @@ type JobScheduleSetDiscardedParams struct {
 }
 
 type JobScheduleSetDiscardedRow struct {
-	ID           int64
-	Column2      []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	Column5      []byte
-	CreatedAt    time.Time
-	Column7      []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Column11     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Column16     []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // Metadata that isn't valid JSON is left in place, and columns are listed out
@@ -1784,6 +1934,7 @@ func (q *Queries) JobScheduleSetDiscarded(ctx context.Context, db DBTX, arg *Job
 			&i.Column16,
 			&i.UniqueKey,
 			&i.UniqueStates,
+			&i.LeaseExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1823,7 +1974,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 `
 
 type JobSetMetadataIfNotRunningParams struct {
@@ -1832,24 +1984,25 @@ type JobSetMetadataIfNotRunningParams struct {
 }
 
 type JobSetMetadataIfNotRunningRow struct {
-	ID           int64
-	Column2      []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	Column5      []byte
-	CreatedAt    time.Time
-	Column7      []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Column11     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Column16     []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // This doesn't exist under the Postgres driver, but needed as an extra query
@@ -1878,6 +2031,7 @@ func (q *Queries) JobSetMetadataIfNotRunning(ctx context.Context, db DBTX, arg *
 		&i.Column16,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -1912,6 +2066,7 @@ SET
     scheduled_at = CASE WHEN /* NOT should_cancel */(cast(?1 AS text) <> 'available' AND ?1 <> 'retryable' AND ?1 <> 'scheduled' OR (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NULL) AND cast(?11 AS boolean)
                         THEN cast(?12 AS text)
                         ELSE scheduled_at END,
+    lease_expires_at = CASE WHEN ?1 = 'running' THEN lease_expires_at END,
     state        = CASE WHEN /* should_cancel */((?1 = 'available' OR ?1 = 'retryable' OR ?1 = 'scheduled') AND (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NOT NULL)
                         THEN 'cancelled'
                         ELSE ?1 END
@@ -1935,7 +2090,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 `
 
 type JobSetStateIfRunningParams struct {
@@ -1955,24 +2111,25 @@ type JobSetStateIfRunningParams struct {
 }
 
 type JobSetStateIfRunningRow struct {
-	ID           int64
-	Column2      []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	Column5      []byte
-	CreatedAt    time.Time
-	Column7      []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Column11     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Column16     []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Column2        []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	Column5        []byte
+	CreatedAt      time.Time
+	Column7        []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Column11       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Column16       []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 // Differs significantly from the Postgres version in that it can't do a bulk
@@ -2019,6 +2176,7 @@ func (q *Queries) JobSetStateIfRunning(ctx context.Context, db DBTX, arg *JobSet
 		&i.Column16,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -2028,7 +2186,7 @@ UPDATE /* TEMPLATE: schema */river_job
 SET
     metadata = CASE WHEN cast(?1 AS boolean) THEN jsonb_patch(json(metadata), json(?2)) ELSE metadata END
 WHERE id = ?3
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobUpdateParams struct {
@@ -2059,6 +2217,7 @@ func (q *Queries) JobUpdate(ctx context.Context, db DBTX, arg *JobUpdateParams) 
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }
@@ -2071,11 +2230,12 @@ SET
     attempted_by = CASE WHEN cast(?5 AS boolean) THEN jsonb(?6) ELSE attempted_by END,
     errors = CASE WHEN cast(?7 AS boolean) THEN jsonb(?8) ELSE errors END,
     finalized_at = CASE WHEN cast(?9 AS boolean) THEN cast(?10 AS text) ELSE finalized_at END,
-    max_attempts = CASE WHEN cast(?11 AS boolean) THEN ?12 ELSE max_attempts END,
-    metadata = CASE WHEN cast(?13 AS boolean) THEN jsonb(?14) ELSE metadata END,
-    state = CASE WHEN cast(?15 AS boolean) THEN ?16 ELSE state END
+    lease_expires_at = CASE WHEN cast(?11 AS boolean) AND ?12 <> 'running' THEN NULL ELSE lease_expires_at END,
+    max_attempts = CASE WHEN cast(?13 AS boolean) THEN ?14 ELSE max_attempts END,
+    metadata = CASE WHEN cast(?15 AS boolean) THEN jsonb(?16) ELSE metadata END,
+    state = CASE WHEN cast(?11 AS boolean) THEN ?12 ELSE state END
 WHERE id = ?17
-RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states
+RETURNING id, json(args), attempt, attempted_at, json(attempted_by), created_at, json(errors), finalized_at, kind, max_attempts, json(metadata), priority, queue, state, scheduled_at, json(tags), unique_key, unique_states, lease_expires_at
 `
 
 type JobUpdateFullParams struct {
@@ -2089,12 +2249,12 @@ type JobUpdateFullParams struct {
 	Errors              interface{}
 	FinalizedAtDoUpdate bool
 	FinalizedAt         *string
+	StateDoUpdate       bool
+	State               interface{}
 	MaxAttemptsDoUpdate bool
 	MaxAttempts         int64
 	MetadataDoUpdate    bool
 	Metadata            interface{}
-	StateDoUpdate       bool
-	State               string
 	ID                  int64
 }
 
@@ -2112,12 +2272,12 @@ func (q *Queries) JobUpdateFull(ctx context.Context, db DBTX, arg *JobUpdateFull
 		arg.Errors,
 		arg.FinalizedAtDoUpdate,
 		arg.FinalizedAt,
+		arg.StateDoUpdate,
+		arg.State,
 		arg.MaxAttemptsDoUpdate,
 		arg.MaxAttempts,
 		arg.MetadataDoUpdate,
 		arg.Metadata,
-		arg.StateDoUpdate,
-		arg.State,
 		arg.ID,
 	)
 	var i RiverJob
@@ -2140,6 +2300,7 @@ func (q *Queries) JobUpdateFull(ctx context.Context, db DBTX, arg *JobUpdateFull
 		&i.Tags,
 		&i.UniqueKey,
 		&i.UniqueStates,
+		&i.LeaseExpiresAt,
 	)
 	return &i, err
 }

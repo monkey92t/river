@@ -72,6 +72,14 @@
       {
         "file": "009_sequences.up.sql",
         "sha256": "413dd25f464c429181c4cb1ae660b5c3a553c676d8980333d7bc4ebc56a80bd7"
+      },
+      {
+        "file": "010_job_lease.down.sql",
+        "sha256": "b25fb185cded5dc6cc8e6b7400128cc0d5a5d552d28bf7325914d2e24903daa4"
+      },
+      {
+        "file": "010_job_lease.up.sql",
+        "sha256": "5f2815d04287e078e76491ca7d5b298813adc8abd808887fb4af3c3804197cfc"
       }
     ],
     "sqlite": [
@@ -146,6 +154,14 @@
       {
         "file": "009_sequences.up.sql",
         "sha256": "4d3eaa625d0880789a30c76a5aa0c2d4f4c5934b91fdf65757e99f452fd7d206"
+      },
+      {
+        "file": "010_job_lease.down.sql",
+        "sha256": "e2586c0f1ae078bbe6dcf955e4d2ffd3118e8543bd71b2fa4fbd0663715467a0"
+      },
+      {
+        "file": "010_job_lease.up.sql",
+        "sha256": "721714cdf584cc1989cb2edeb1536271c0eee2a784e68520b5f3df8e6544eaa7"
       }
     ]
   },

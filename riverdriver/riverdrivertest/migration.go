@@ -261,6 +261,31 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		require.NotZero(t, queue.UpdatedAt)
 	})
 
+	t.Run("MigrateLeasePreservesLegacyJobs", func(t *testing.T) {
+		t.Parallel()
+
+		driver, schema := driverWithSchema(ctx, t, &riverdbtest.TestSchemaOpts{
+			DisableReuse:       true,
+			LineTargetVersions: map[string]int{riverdriver.MigrationLineMain: 9},
+		})
+		exec := driver.GetExecutor()
+		var jobID int64
+		require.NoError(t, exec.QueryRow(ctx, "INSERT INTO "+migrationSchemaPrefix(schema)+"river_job (kind, args, state) VALUES ('lease_migration', '{}', 'running') RETURNING id").Scan(&jobID))
+		migrator, err := rivermigrate.New(driver, &rivermigrate.Config{Logger: riversharedtest.Logger(t), Schema: schema})
+		require.NoError(t, err)
+		_, err = migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
+		require.NoError(t, err)
+		job, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: jobID, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateRunning, job.State)
+		require.Nil(t, job.LeaseExpiresAt)
+		_, err = migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{TargetVersion: 9})
+		require.NoError(t, err)
+		exists, err := exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{Column: "lease_expires_at", Schema: schema, Table: "river_job"})
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+
 	t.Run("MigrateSequenceDownRejectsDurableMembers", func(t *testing.T) {
 		t.Parallel()
 
@@ -278,14 +303,15 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		_, err = migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{TargetVersion: 8})
 		require.ErrorContains(t, err, "cannot remove sequences while sequence groups or members remain")
-		retained, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
-		require.NoError(t, err)
-		require.Equal(t, rivertype.JobStatePending, retained.State)
-		require.Equal(t, "durable", *retained.SequenceKey)
+		// Earlier down migrations may already have removed columns projected by
+		// the current driver. Inspect the retained sequence columns directly.
+		var retainedState, retainedKey string
+		require.NoError(t, exec.QueryRow(ctx, fmt.Sprintf("SELECT state, sequence_key FROM %sriver_job WHERE id = %d", migrationSchemaPrefix(schema), job.ID)).Scan(&retainedState, &retainedKey))
+		require.Equal(t, string(rivertype.JobStatePending), retainedState)
+		require.Equal(t, "durable", retainedKey)
 
 		// Persistent group policy alone is sufficient to prevent accidental removal.
-		_, err = exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schema})
-		require.NoError(t, err)
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf("DELETE FROM %sriver_job WHERE id = %d", migrationSchemaPrefix(schema), job.ID)))
 		require.NoError(t, sequenceExec.SequenceGroupEnsure(ctx, &riverdriver.SequenceGroupKeyParams{Key: "durable", Schema: schema}))
 		_, err = migrator.Migrate(ctx, rivermigrate.DirectionDown, &rivermigrate.MigrateOpts{TargetVersion: 8})
 		require.ErrorContains(t, err, "cannot remove sequences while sequence groups or members remain")
@@ -324,7 +350,9 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 							t.Skip("SQLite table rebuild")
 						}
 						exec := driver.GetExecutor()
-						job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{Schema: schema})
+						// Seed the old schema without projecting columns added later.
+						var jobID int64
+						require.NoError(t, exec.QueryRow(ctx, "INSERT INTO river_job (kind, args) VALUES ('migration_fixture', '{}') RETURNING id").Scan(&jobID))
 
 						// Deliberately omit Pro migration records, as when applying SQL
 						// through an external migration tool.
@@ -336,9 +364,9 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 						_, err = migrator.Migrate(ctx, direction, &rivermigrate.MigrateOpts{MaxSteps: 1})
 						require.ErrorContains(t, err, "River SQLite migration 008 cannot run while River Pro schema is installed")
 
-						jobAfter, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
-						require.NoError(t, err)
-						require.Equal(t, job, jobAfter)
+						var retainedID int64
+						require.NoError(t, exec.QueryRow(ctx, fmt.Sprintf("SELECT id FROM river_job WHERE id = %d", jobID)).Scan(&retainedID))
+						require.Equal(t, jobID, retainedID)
 						exists, err := exec.ColumnExists(ctx, &riverdriver.ColumnExistsParams{Column: "partition_key", Schema: schema, Table: "river_job"})
 						require.NoError(t, err)
 						require.True(t, exists)

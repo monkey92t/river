@@ -258,7 +258,8 @@ type Executor interface {
 	// restricted to the provided IDs.
 	JobGetCancelRequested(ctx context.Context, params *JobGetCancelRequestedParams) ([]int64, error)
 
-	// JobGetStuck gets jobs that have been running since before a horizon. A
+	// JobGetStuck gets expired leases past their grace period and legacy running
+	// jobs attempted before the horizon. A
 	// job row that can't be fully decoded is returned with the fields that
 	// couldn't be decoded left empty so that one bad row can't prevent stuck
 	// jobs from being rescued.
@@ -270,6 +271,9 @@ type Executor interface {
 	JobInsertFullMany(ctx context.Context, jobs *JobInsertFullManyParams) ([]*rivertype.JobRow, error)
 	JobKindList(ctx context.Context, params *JobKindListParams) ([]string, error)
 	JobList(ctx context.Context, params *JobListParams) ([]*rivertype.JobRow, error)
+
+	// JobRenewLeaseMany renews unexpired leases matching the original claim snapshot.
+	JobRenewLeaseMany(ctx context.Context, params *JobRenewLeaseManyParams) ([]*rivertype.JobRow, error)
 	JobRescueMany(ctx context.Context, params *JobRescueManyParams) (*struct{}, error)
 	JobRetry(ctx context.Context, params *JobRetryParams) (*rivertype.JobRow, error)
 	JobSchedule(ctx context.Context, params *JobScheduleParams) ([]*JobScheduleResult, error)
@@ -467,6 +471,9 @@ type JobGetAvailableParams struct {
 	// non-nil slice allows none. Filtering occurs before the limit and locking.
 	Kind []string
 
+	// LeaseDuration enables a lease when positive; zero preserves legacy claims.
+	LeaseDuration time.Duration
+
 	MaxAttemptedBy int
 	MaxToLock      int
 	Now            *time.Time
@@ -510,10 +517,12 @@ type JobGetCancelRequestedParams struct {
 }
 
 type JobGetStuckParams struct {
-	AfterID      int64
-	Max          int
-	Schema       string
-	StuckHorizon time.Time
+	AfterID int64
+	// LeaseGracePeriod is the delay after lease expiry before rescue.
+	LeaseGracePeriod time.Duration
+	Max              int
+	Schema           string
+	StuckHorizon     time.Time
 }
 
 type JobInsertFastParams struct {
@@ -588,14 +597,27 @@ type JobListParams struct {
 	WhereClause   string
 }
 
+// JobRenewLeaseManyParams identifies active executions by their claim snapshots.
+// Renewal leaves these snapshots unchanged so an unconfirmed renewal is retryable.
+type JobRenewLeaseManyParams struct {
+	IDs           []int64
+	AttemptedAt   []time.Time
+	Attempts      []int
+	LeaseDuration time.Duration
+	Schema        string
+}
+
 type JobRescueManyParams struct {
-	ID           []int64
-	Error        [][]byte
-	FinalizedAt  []*time.Time
-	ScheduledAt  []time.Time
-	Schema       string
-	State        []string
-	StuckHorizon time.Time
+	ID          []int64
+	Error       [][]byte
+	FinalizedAt []*time.Time
+	// LeaseExpiresAt contains the candidate expiry per ID; nil entries are legacy jobs.
+	LeaseExpiresAt   []*time.Time
+	LeaseGracePeriod time.Duration
+	ScheduledAt      []time.Time
+	Schema           string
+	State            []string
+	StuckHorizon     time.Time
 }
 
 type JobRetryParams struct {

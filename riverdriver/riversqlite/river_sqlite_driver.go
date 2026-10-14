@@ -578,11 +578,12 @@ func (e *Executor) JobGetAvailable(ctx context.Context, params *riverdriver.JobG
 	})
 
 	jobs, err := dbsqlc.New().JobGetAvailable(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetAvailableParams{
-		Kind:       kindsJSON,
-		KindFilter: params.Kind != nil,
-		MaxToLock:  int64(params.MaxToLock),
-		Now:        timeStringNullable(params.Now),
-		Queue:      params.Queue,
+		Kind:          kindsJSON,
+		LeaseDuration: params.LeaseDuration.Seconds(),
+		KindFilter:    params.Kind != nil,
+		MaxToLock:     int64(params.MaxToLock),
+		Now:           timeStringNullable(params.Now),
+		Queue:         params.Queue,
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -621,9 +622,10 @@ func (e *Executor) JobGetCancelRequested(ctx context.Context, params *riverdrive
 
 func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
 	jobs, err := dbsqlc.New().JobGetStuck(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobGetStuckParams{
-		AfterID:      params.AfterID,
-		Max:          int64(params.Max),
-		StuckHorizon: timeString(params.StuckHorizon),
+		AfterID:          params.AfterID,
+		LeaseGracePeriod: params.LeaseGracePeriod.Seconds(),
+		Max:              int64(params.Max),
+		StuckHorizon:     timeString(params.StuckHorizon),
 	})
 	if err != nil {
 		return nil, interpretError(err)
@@ -805,6 +807,36 @@ func (e *Executor) JobList(ctx context.Context, params *riverdriver.JobListParam
 	return sliceutil.MapError(jobs, jobRowFromInternal)
 }
 
+// JobRenewLeaseMany renews unexpired leases matching the original claim snapshot.
+func (e *Executor) JobRenewLeaseMany(ctx context.Context, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
+	if len(params.IDs) != len(params.AttemptedAt) || len(params.IDs) != len(params.Attempts) || params.LeaseDuration <= 0 {
+		return nil, errors.New("lease renewal requires matching IDs, attempt times, and attempts and a positive duration")
+	}
+	type leaseInput struct {
+		ID          int64  `json:"id"`
+		Attempt     int    `json:"attempt"`
+		AttemptedAt string `json:"attempted_at"`
+	}
+	leases := make([]leaseInput, len(params.IDs))
+	for i, id := range params.IDs {
+		leases[i] = leaseInput{ID: id, Attempt: params.Attempts[i], AttemptedAt: timeString(params.AttemptedAt[i])}
+	}
+	encoded, err := json.Marshal(leases)
+	if err != nil {
+		return nil, err
+	}
+	jobs, err := dbsqlc.New().JobRenewLeaseMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, &dbsqlc.JobRenewLeaseManyParams{
+		LeaseDuration: params.LeaseDuration.Seconds(),
+		Leases:        encoded,
+	})
+	if err != nil {
+		return nil, interpretError(err)
+	}
+	return jobRowsFromInternalPartial(sliceutil.Map(jobs, func(job *dbsqlc.JobRenewLeaseManyRow) *dbsqlc.RiverJob {
+		return jobFromReturningRow((*dbsqlc.JobGetAvailableRow)(job))
+	})), nil
+}
+
 func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
 	if err := dbutil.WithTx(ctx, e.executor(), func(ctx context.Context, execTx riverdriver.ExecutorTx) error {
 		ctx = schemaTemplateParam(ctx, params.Schema)
@@ -812,13 +844,19 @@ func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRes
 
 		// Should be a batch rescue, but that's currently impossible with SQLite/sqlc. https://github.com/sqlc-dev/sqlc/issues/3802
 		for i := range params.ID {
+			var leaseExpiresAt *string
+			if len(params.LeaseExpiresAt) > i {
+				leaseExpiresAt = timeStringNullable(params.LeaseExpiresAt[i])
+			}
 			if err := dbsqlc.New().JobRescue(ctx, dbtx, &dbsqlc.JobRescueParams{
-				ID:           params.ID[i],
-				Error:        params.Error[i],
-				FinalizedAt:  timeStringNullable(params.FinalizedAt[i]),
-				ScheduledAt:  timeString(params.ScheduledAt[i]),
-				State:        params.State[i],
-				StuckHorizon: timeString(params.StuckHorizon),
+				ID:               params.ID[i],
+				Error:            params.Error[i],
+				FinalizedAt:      timeStringNullable(params.FinalizedAt[i]),
+				LeaseExpiresAt:   leaseExpiresAt,
+				LeaseGracePeriod: params.LeaseGracePeriod.Seconds(),
+				ScheduledAt:      timeString(params.ScheduledAt[i]),
+				State:            params.State[i],
+				StuckHorizon:     timeString(params.StuckHorizon),
 			}); err != nil {
 				return interpretError(err)
 			}
@@ -1723,24 +1761,25 @@ func sqliteJobInsertFullManyJobsParam(jobs []*riverdriver.JobInsertFullParams) (
 // use this too.
 func jobFromReturningRow(row *dbsqlc.JobGetAvailableRow) *dbsqlc.RiverJob {
 	return &dbsqlc.RiverJob{
-		ID:           row.ID,
-		Args:         row.Column2,
-		Attempt:      row.Attempt,
-		AttemptedAt:  row.AttemptedAt,
-		AttemptedBy:  row.Column5,
-		CreatedAt:    row.CreatedAt,
-		Errors:       row.Column7,
-		FinalizedAt:  row.FinalizedAt,
-		Kind:         row.Kind,
-		MaxAttempts:  row.MaxAttempts,
-		Metadata:     row.Column11,
-		Priority:     row.Priority,
-		Queue:        row.Queue,
-		State:        row.State,
-		ScheduledAt:  row.ScheduledAt,
-		Tags:         row.Column16,
-		UniqueKey:    row.UniqueKey,
-		UniqueStates: row.UniqueStates,
+		ID:             row.ID,
+		Args:           row.Column2,
+		Attempt:        row.Attempt,
+		AttemptedAt:    row.AttemptedAt,
+		AttemptedBy:    row.Column5,
+		CreatedAt:      row.CreatedAt,
+		Errors:         row.Column7,
+		FinalizedAt:    row.FinalizedAt,
+		Kind:           row.Kind,
+		LeaseExpiresAt: row.LeaseExpiresAt,
+		MaxAttempts:    row.MaxAttempts,
+		Metadata:       row.Column11,
+		Priority:       row.Priority,
+		Queue:          row.Queue,
+		State:          row.State,
+		ScheduledAt:    row.ScheduledAt,
+		Tags:           row.Column16,
+		UniqueKey:      row.UniqueKey,
+		UniqueStates:   row.UniqueStates,
 	}
 }
 
@@ -1837,24 +1876,25 @@ func jobRowFromInternalPartial(internal *dbsqlc.RiverJob) (*rivertype.JobRow, er
 	}
 
 	return &rivertype.JobRow{
-		ID:           internal.ID,
-		Attempt:      max(int(internal.Attempt), 0),
-		AttemptedAt:  attemptedAt,
-		AttemptedBy:  attemptedBy,
-		CreatedAt:    internal.CreatedAt.UTC(),
-		EncodedArgs:  encodedArgs,
-		Errors:       attemptErrors,
-		FinalizedAt:  finalizedAt,
-		Kind:         internal.Kind,
-		MaxAttempts:  max(int(internal.MaxAttempts), 0),
-		Metadata:     metadata,
-		Priority:     max(int(internal.Priority), 0),
-		Queue:        internal.Queue,
-		ScheduledAt:  internal.ScheduledAt.UTC(),
-		State:        rivertype.JobState(internal.State),
-		Tags:         tags,
-		UniqueKey:    internal.UniqueKey,
-		UniqueStates: uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
+		ID:             internal.ID,
+		Attempt:        max(int(internal.Attempt), 0),
+		AttemptedAt:    attemptedAt,
+		AttemptedBy:    attemptedBy,
+		CreatedAt:      internal.CreatedAt.UTC(),
+		EncodedArgs:    encodedArgs,
+		Errors:         attemptErrors,
+		FinalizedAt:    finalizedAt,
+		Kind:           internal.Kind,
+		LeaseExpiresAt: internal.LeaseExpiresAt,
+		MaxAttempts:    max(int(internal.MaxAttempts), 0),
+		Metadata:       metadata,
+		Priority:       max(int(internal.Priority), 0),
+		Queue:          internal.Queue,
+		ScheduledAt:    internal.ScheduledAt.UTC(),
+		State:          rivertype.JobState(internal.State),
+		Tags:           tags,
+		UniqueKey:      internal.UniqueKey,
+		UniqueStates:   uniquestates.UniqueBitmaskToStates(uniqueStatesByte),
 	}, errors.Join(decodeErrs...)
 }
 

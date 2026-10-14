@@ -27,8 +27,11 @@ import (
 )
 
 const (
-	JobRescuerRescueAfterDefault = time.Hour
-	JobRescuerIntervalDefault    = 30 * time.Second
+	// JobRescuerLeaseGracePeriodDefault gives an expired execution time to exit
+	// before its job can be rescued.
+	JobRescuerLeaseGracePeriodDefault = time.Minute
+	JobRescuerRescueAfterDefault      = time.Hour
+	JobRescuerIntervalDefault         = 30 * time.Second
 )
 
 // JobRescuerTestSignals are internal signals used exclusively in tests.
@@ -56,11 +59,15 @@ type JobRescuerConfig struct {
 	// Interval is the amount of time to wait between runs of the rescuer.
 	Interval time.Duration
 
+	// LeaseGracePeriod is the additional wait after a running job's lease
+	// expires. Leased jobs are rescued independently of their execution timeout.
+	LeaseGracePeriod time.Duration
+
 	// Pilot controls driver-level behavior that can be customized by plugins.
 	Pilot riverpilot.Pilot
 
-	// RescueAfter is the amount of time for a job to be active before it is
-	// considered stuck and should be rescued.
+	// RescueAfter is the amount of time for a job without a lease to be active
+	// before it is considered stuck and should be rescued.
 	RescueAfter time.Duration
 
 	// Schema where River tables are located. Empty string omits schema, causing
@@ -79,6 +86,9 @@ func (c *JobRescuerConfig) mustValidate() *JobRescuerConfig {
 	if c.Interval <= 0 {
 		panic("RescuerConfig.Interval must be above zero")
 	}
+	if c.LeaseGracePeriod < 0 {
+		panic("RescuerConfig.LeaseGracePeriod must not be negative")
+	}
 	if c.Pilot == nil {
 		panic("RescuerConfig.Pilot must be set")
 	}
@@ -92,8 +102,8 @@ func (c *JobRescuerConfig) mustValidate() *JobRescuerConfig {
 	return c
 }
 
-// JobRescuer periodically rescues jobs that have been executing for too long
-// and are considered to be "stuck".
+// JobRescuer periodically rescues jobs whose leases have expired, or legacy jobs
+// without a lease that have been executing for too long.
 type JobRescuer struct {
 	riversharedmaintenance.QueueMaintainerServiceBase
 	startstop.BaseStartStop
@@ -126,6 +136,7 @@ func NewRescuer(archetype *baseservice.Archetype, config *JobRescuerConfig, exec
 			ClientJobTimeout:    config.ClientJobTimeout,
 			ClientRetryPolicy:   config.ClientRetryPolicy,
 			Interval:            cmp.Or(config.Interval, JobRescuerIntervalDefault),
+			LeaseGracePeriod:    cmp.Or(config.LeaseGracePeriod, JobRescuerLeaseGracePeriodDefault),
 			Pilot:               pilot,
 			RescueAfter:         cmp.Or(config.RescueAfter, JobRescuerRescueAfterDefault),
 			Schema:              config.Schema,
@@ -223,13 +234,15 @@ func (s *JobRescuer) runOnce(ctx context.Context) (*rescuerRunOnceResult, error)
 		now := time.Now().UTC()
 
 		rescueManyParams := riverdriver.JobRescueManyParams{
-			ID:           make([]int64, 0, len(stuckJobs)),
-			Error:        make([][]byte, 0, len(stuckJobs)),
-			FinalizedAt:  make([]*time.Time, 0, len(stuckJobs)),
-			ScheduledAt:  make([]time.Time, 0, len(stuckJobs)),
-			Schema:       s.Config.Schema,
-			State:        make([]string, 0, len(stuckJobs)),
-			StuckHorizon: stuckHorizon,
+			ID:               make([]int64, 0, len(stuckJobs)),
+			Error:            make([][]byte, 0, len(stuckJobs)),
+			FinalizedAt:      make([]*time.Time, 0, len(stuckJobs)),
+			LeaseExpiresAt:   make([]*time.Time, 0, len(stuckJobs)),
+			LeaseGracePeriod: s.Config.LeaseGracePeriod,
+			ScheduledAt:      make([]time.Time, 0, len(stuckJobs)),
+			Schema:           s.Config.Schema,
+			State:            make([]string, 0, len(stuckJobs)),
+			StuckHorizon:     stuckHorizon,
 		}
 
 		for _, job := range stuckJobs {
@@ -252,6 +265,7 @@ func (s *JobRescuer) runOnce(ctx context.Context) (*rescuerRunOnceResult, error)
 				rescueManyParams.ID = append(rescueManyParams.ID, job.ID)
 				rescueManyParams.Error = append(rescueManyParams.Error, errorData)
 				rescueManyParams.FinalizedAt = append(rescueManyParams.FinalizedAt, finalizedAt)
+				rescueManyParams.LeaseExpiresAt = append(rescueManyParams.LeaseExpiresAt, job.LeaseExpiresAt)
 				rescueManyParams.ScheduledAt = append(rescueManyParams.ScheduledAt, scheduledAt)
 				rescueManyParams.State = append(rescueManyParams.State, string(state))
 			}
@@ -301,10 +315,11 @@ func (s *JobRescuer) runOnce(ctx context.Context) (*rescuerRunOnceResult, error)
 
 func (s *JobRescuer) getStuckJobs(ctx context.Context, afterID int64, batchSize int, stuckHorizon time.Time) ([]*rivertype.JobRow, error) {
 	params := &riverdriver.JobGetStuckParams{
-		AfterID:      afterID,
-		Max:          batchSize,
-		Schema:       s.Config.Schema,
-		StuckHorizon: stuckHorizon,
+		AfterID:          afterID,
+		LeaseGracePeriod: s.Config.LeaseGracePeriod,
+		Max:              batchSize,
+		Schema:           s.Config.Schema,
+		StuckHorizon:     stuckHorizon,
 	}
 
 	return timeoututil.WithTimeoutV(ctx, riversharedmaintenance.TimeoutDefault, s.Name+".getStuckJobs", func(ctx context.Context) ([]*rivertype.JobRow, error) {
@@ -354,9 +369,13 @@ func (s *JobRescuer) makeRetryDecision(ctx context.Context, job *rivertype.JobRo
 		return jobRetryDecisionDiscard, time.Time{}
 	}
 
-	timeout := cmp.Or(workUnit.Timeout(), s.Config.ClientJobTimeout)
-	if timeout < 0 || timeout > 0 && now.Sub(*job.AttemptedAt) < timeout {
-		return jobRetryDecisionIgnore, time.Time{}
+	// The database already checked the expiry and grace period for leased
+	// candidates. A long or disabled business timeout must not defer rescue.
+	if job.LeaseExpiresAt == nil {
+		timeout := cmp.Or(workUnit.Timeout(), s.Config.ClientJobTimeout)
+		if timeout < 0 || timeout > 0 && now.Sub(*job.AttemptedAt) < timeout {
+			return jobRetryDecisionIgnore, time.Time{}
+		}
 	}
 
 	nextRetry := workUnit.NextRetry()

@@ -18,6 +18,7 @@ CREATE TABLE river_job (
     tags jsonb NOT NULL DEFAULT (jsonb('[]')), -- JSON array of strings
     unique_key blob,
     unique_states integer,
+    lease_expires_at timestamp,
     CONSTRAINT finalized_or_finalized_at_null CHECK (
         (finalized_at IS NULL AND state NOT IN ('cancelled', 'completed', 'discarded')) OR
         (finalized_at IS NOT NULL AND state IN ('cancelled', 'completed', 'discarded'))
@@ -151,6 +152,7 @@ SET
     -- comments there for more details.
     attempted_by = /* TEMPLATE_BEGIN: attempted_by_clause */ attempted_by /* TEMPLATE_END */,
 
+    lease_expires_at = CASE WHEN cast(@lease_duration AS real) > 0 THEN datetime('now', 'subsec', cast(@lease_duration AS real) || ' seconds') END,
     state = 'running'
 WHERE id IN (
     SELECT id
@@ -185,7 +187,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states;
+    unique_states,
+    lease_expires_at;
 
 -- name: JobGetByID :one
 SELECT *
@@ -237,11 +240,15 @@ SELECT
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states
+    unique_states,
+    lease_expires_at
 FROM /* TEMPLATE: schema */river_job
 WHERE state = 'running'
     AND id > @after_id
-    AND attempted_at < cast(@stuck_horizon AS text)
+    AND (
+        (lease_expires_at IS NULL AND attempted_at < cast(@stuck_horizon AS text))
+        OR lease_expires_at <= datetime('now', 'subsec', -cast(@lease_grace_period AS real) || ' seconds')
+    )
 ORDER BY id
 LIMIT @max;
 
@@ -531,6 +538,40 @@ WHERE /* TEMPLATE_BEGIN: where_clause */ true /* TEMPLATE_END */
 ORDER BY /* TEMPLATE_BEGIN: order_by_clause */ id /* TEMPLATE_END */
 LIMIT @max;
 
+-- Match the unchanged claim snapshot so unconfirmed renewals are retryable.
+-- JSON input keeps this a single batch, and expired leases cannot be revived.
+-- name: JobRenewLeaseMany :many
+UPDATE /* TEMPLATE: schema */river_job
+SET lease_expires_at = datetime('now', 'subsec', cast(@lease_duration AS real) || ' seconds')
+WHERE state = 'running'
+    AND lease_expires_at > datetime('now', 'subsec')
+    AND EXISTS (
+        SELECT 1 FROM json_each(cast(@leases AS blob)) AS lease
+        WHERE river_job.id = json_extract(lease.value, '$.id')
+            AND river_job.attempted_at = json_extract(lease.value, '$.attempted_at')
+            AND river_job.attempt = json_extract(lease.value, '$.attempt')
+    )
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states,
+    lease_expires_at;
+
 -- Rescue a job.
 --
 -- This is supposed to rescue jobs in batches, but various limitations of the
@@ -568,10 +609,16 @@ SET
                             0
                         ) + 1
                     ) END,
+    lease_expires_at = NULL,
     state = @state
 WHERE id = @id
     AND state = 'running'
-    AND attempted_at < cast(@stuck_horizon AS text);
+    AND (
+        (sqlc.narg('lease_expires_at') IS NULL AND lease_expires_at IS NULL
+            AND attempted_at < cast(@stuck_horizon AS text))
+        OR (lease_expires_at = cast(sqlc.narg('lease_expires_at') AS text)
+            AND lease_expires_at <= datetime('now', 'subsec', -cast(@lease_grace_period AS real) || ' seconds'))
+    );
 
 -- Differs by necessity from other drivers because SQLite doesn't support
 -- `UPDATE` inside CTEs so we can't retry if running but select otherwise.
@@ -660,7 +707,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states;
+    unique_states,
+    lease_expires_at;
 
 -- Metadata that isn't valid JSON is left in place, and columns are listed out
 -- to tolerate values that aren't valid JSON. See JobGetAvailable.
@@ -690,7 +738,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states;
+    unique_states,
+    lease_expires_at;
 
 -- This doesn't exist under the Postgres driver, but needed as an extra query
 -- for JobSetStateIfRunning to use when falling back to non-running jobs.
@@ -721,7 +770,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states;
+    unique_states,
+    lease_expires_at;
 
 -- Differs significantly from the Postgres version in that it can't do a bulk
 -- update, and since sqlc doesn't support `UPDATE` in CTEs, we need separate
@@ -761,6 +811,7 @@ SET
     scheduled_at = CASE WHEN /* NOT should_cancel */(cast(@state AS text) <> 'available' AND @state <> 'retryable' AND @state <> 'scheduled' OR (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NULL) AND cast(@scheduled_at_do_update AS boolean)
                         THEN cast(@scheduled_at AS text)
                         ELSE scheduled_at END,
+    lease_expires_at = CASE WHEN @state = 'running' THEN lease_expires_at END,
     state        = CASE WHEN /* should_cancel */((@state = 'available' OR @state = 'retryable' OR @state = 'scheduled') AND (CASE WHEN typeof(metadata) <> 'text' OR json_valid(metadata) THEN metadata -> 'cancel_attempted_at' END) IS NOT NULL)
                         THEN 'cancelled'
                         ELSE @state END
@@ -784,7 +835,8 @@ RETURNING
     scheduled_at,
     cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
     unique_key,
-    unique_states;
+    unique_states,
+    lease_expires_at;
 
 -- name: JobUpdate :one
 UPDATE /* TEMPLATE: schema */river_job
@@ -803,6 +855,7 @@ SET
     attempted_by = CASE WHEN cast(@attempted_by_do_update AS boolean) THEN jsonb(@attempted_by) ELSE attempted_by END,
     errors = CASE WHEN cast(@errors_do_update AS boolean) THEN jsonb(@errors) ELSE errors END,
     finalized_at = CASE WHEN cast(@finalized_at_do_update AS boolean) THEN cast(sqlc.narg('finalized_at') AS text) ELSE finalized_at END,
+    lease_expires_at = CASE WHEN cast(@state_do_update AS boolean) AND @state <> 'running' THEN NULL ELSE lease_expires_at END,
     max_attempts = CASE WHEN cast(@max_attempts_do_update AS boolean) THEN @max_attempts ELSE max_attempts END,
     metadata = CASE WHEN cast(@metadata_do_update AS boolean) THEN jsonb(@metadata) ELSE metadata END,
     state = CASE WHEN cast(@state_do_update AS boolean) THEN @state ELSE state END

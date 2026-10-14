@@ -9,24 +9,25 @@ import (
 )
 
 type RiverJob struct {
-	ID           int64
-	Args         []byte
-	Attempt      int64
-	AttemptedAt  *time.Time
-	AttemptedBy  []byte
-	CreatedAt    time.Time
-	Errors       []byte
-	FinalizedAt  *time.Time
-	Kind         string
-	MaxAttempts  int64
-	Metadata     []byte
-	Priority     int64
-	Queue        string
-	State        string
-	ScheduledAt  time.Time
-	Tags         []byte
-	UniqueKey    []byte
-	UniqueStates *int64
+	ID             int64
+	Args           []byte
+	Attempt        int64
+	AttemptedAt    *time.Time
+	AttemptedBy    []byte
+	CreatedAt      time.Time
+	Errors         []byte
+	FinalizedAt    *time.Time
+	Kind           string
+	MaxAttempts    int64
+	Metadata       []byte
+	Priority       int64
+	Queue          string
+	State          string
+	ScheduledAt    time.Time
+	Tags           []byte
+	UniqueKey      []byte
+	UniqueStates   *int64
+	LeaseExpiresAt *time.Time
 }
 
 type RiverLeader struct {

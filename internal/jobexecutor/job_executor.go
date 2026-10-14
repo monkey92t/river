@@ -16,6 +16,7 @@ import (
 
 	"github.com/riverqueue/river/internal/execution"
 	"github.com/riverqueue/river/internal/jobcompleter"
+	"github.com/riverqueue/river/internal/joblease"
 	"github.com/riverqueue/river/internal/jobstats"
 	"github.com/riverqueue/river/internal/pluginlookup"
 	"github.com/riverqueue/river/internal/rivercommon"
@@ -131,6 +132,11 @@ type JobExecutor struct {
 	// other failed attempt.
 	JobRowDecodeErr error
 
+	// LeaseCancelGracePeriod bounds renewal after an uncooperative cancellation.
+	LeaseCancelGracePeriod time.Duration
+	// LeaseFinalizeTimeout bounds renewal while a returned result awaits commit.
+	LeaseFinalizeTimeout time.Duration
+
 	ProducerCallbacks struct {
 		JobDone func(jobRow *rivertype.JobRow)
 		Stuck   func(ctx context.Context, jobRow *rivertype.JobRow)
@@ -163,6 +169,8 @@ func (e *JobExecutor) Cancel(ctx context.Context) {
 func (e *JobExecutor) Execute(ctx context.Context) {
 	// Ensure that the context is cancelled no matter what, or it will leak:
 	defer e.CancelFunc(errExecutorDefaultCancel)
+	stopLeaseWatch := e.watchLeaseCancellation(ctx)
+	defer stopLeaseWatch()
 
 	e.start = e.Time.Now()
 	e.stats = &jobstats.JobStatistics{
@@ -170,12 +178,21 @@ func (e *JobExecutor) Execute(ctx context.Context) {
 	}
 
 	res := e.execute(ctx)
+	joblease.FromContext(ctx).Finalize(cmp.Or(e.LeaseFinalizeTimeout, 30*time.Second))
 	e.reportResults(ctx, res)
 	e.ProducerCallbacks.JobDone(e.JobRow)
 }
 
 func (e *JobExecutor) reportResults(ctx context.Context, res *jobExecutorResult) {
+	if joblease.FromContext(ctx).Check() != nil {
+		return
+	}
 	if multiJobErrors, ok := res.Err.(withJobsAndErrorsByID); ok {
+		if guard := joblease.FromContext(ctx); guard != nil {
+			e.Logger.ErrorContext(ctx, e.Name+": multiple-job results require plugin lease integration; abandoning execution", slog.Int64("job_id", e.JobRow.ID))
+			guard.Abandon()
+			return
+		}
 		e.reportMultiJobResults(ctx, res, multiJobErrors)
 		return
 	}
@@ -241,6 +258,10 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 		e.stats.RunDuration = e.Time.Now().Sub(e.start)
 	}()
 
+	if err := joblease.FromContext(ctx).Check(); err != nil {
+		return &jobExecutorResult{Err: err}
+	}
+
 	if e.JobRowDecodeErr != nil {
 		e.Logger.ErrorContext(ctx, e.Name+": Job row couldn't be decoded; failing attempt without working it",
 			slog.String("error", e.JobRowDecodeErr.Error()),
@@ -287,6 +308,12 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 			defer watchStuckCancel()
 		}
 
+		stopLeaseWatch := e.watchLeaseCancellation(ctx)
+		defer stopLeaseWatch()
+		if err := joblease.FromContext(ctx).Check(); err != nil {
+			return err
+		}
+
 		err := e.WorkUnit.Work(ctx)
 
 		{
@@ -324,6 +351,18 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 		JobArgsUnmarshaled: jobArgsUnmarshaled,
 		MetadataUpdates:    metadataUpdates,
 	}
+}
+
+// watchLeaseCancellation bounds the renewal lifetime of uncooperative work.
+func (e *JobExecutor) watchLeaseCancellation(ctx context.Context) func() {
+	guard := joblease.FromContext(ctx)
+	if guard == nil {
+		return func() {}
+	}
+	stop := context.AfterFunc(ctx, func() {
+		guard.CancelAfter(cmp.Or(e.LeaseCancelGracePeriod, 10*time.Second))
+	})
+	return func() { stop() }
 }
 
 // Watches for jobs that may have become stuck. i.e. They've run longer than
@@ -407,6 +446,9 @@ func (e *JobExecutor) invokeErrorHandler(ctx context.Context, jobRow *rivertype.
 }
 
 func (e *JobExecutor) reportResult(ctx context.Context, jobRow *rivertype.JobRow, res *jobExecutorResult) {
+	if joblease.FromContext(ctx).Check() != nil {
+		return
+	}
 	var snoozeErr *rivertype.JobSnoozeError
 
 	marshalMetadataUpdates := func(metadataUpdates map[string]any) ([]byte, error) {
