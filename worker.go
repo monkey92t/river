@@ -54,6 +54,8 @@ type Worker[T JobArgs] interface {
 	// its context is cancelled. A timeout of zero (the default) means the job
 	// will inherit the Client-level timeout. A timeout of -1 means the job's
 	// context will never time out.
+	// The timeout covers worker middleware, work hooks, and Work. It is resolved
+	// from decoded job arguments before entering middleware or work hooks.
 	Timeout(job *Job[T]) time.Duration
 
 	// Work performs the job and returns an error if the job failed. The context

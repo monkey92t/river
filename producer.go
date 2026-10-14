@@ -1000,7 +1000,7 @@ func (p *producer) startNewExecutors(workCtx context.Context, jobs []*rivertype.
 		// jobCancel will always be called by the executor to prevent leaks.
 		jobCtx, jobCancel := context.WithCancelCause(workCtx)
 		if p.config.JobLeaseManager != nil {
-			guard := p.config.JobLeaseManager.Register(job, sentAt, jobCancel)
+			guard := p.config.JobLeaseManager.Register(jobCtx, job, sentAt, jobCancel)
 			jobCtx = joblease.WithGuard(jobCtx, guard)
 		}
 

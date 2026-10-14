@@ -42,6 +42,7 @@ import (
 	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/maputil"
+	"github.com/riverqueue/river/rivershared/util/ptrutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivershared/util/testutil"
 	"github.com/riverqueue/river/rivershared/util/valutil"
@@ -243,6 +244,8 @@ type Config struct {
 	// context is cancelled. A timeout of zero means JobTimeoutDefault will be
 	// used, whereas a value of -1 means the job's context will not be cancelled
 	// unless the Client is shutting down.
+	// The timeout covers worker middleware, work hooks, and Work, starting after
+	// job arguments are decoded and the worker-specific timeout is resolved.
 	//
 	// Defaults to 1 minute.
 	JobTimeout time.Duration
@@ -3365,11 +3368,18 @@ type SequenceListOpts struct {
 // Kind participates unless ExcludeKind is set. With ByArgs, fields tagged
 // river:"sequence" select the argument fingerprint; otherwise all encoded args
 // participate. A group with no selected dimension falls back to kind.
+// Success, cancellation, discard, and deletion allow the next member to run by
+// default. Retries and snoozes keep successors waiting for the current member.
+// Policies are persisted at insertion; changing defaults does not alter existing jobs.
 type SequenceOpts struct {
-	ByArgs              bool
-	ByQueue             bool
-	ContinueOnCancelled bool
-	ContinueOnDiscarded bool
+	ByArgs  bool
+	ByQueue bool
+	// ContinueOnCancelled defaults to true when nil. Set to new(false) to stop
+	// the group when this member is cancelled.
+	ContinueOnCancelled *bool
+	// ContinueOnDiscarded defaults to true when nil. Set to new(false) to stop
+	// the group when this member exhausts its retries.
+	ContinueOnDiscarded *bool
 	ExcludeKind         bool
 }
 
@@ -3511,8 +3521,8 @@ func (c *Client[TTx]) attachSequenceInsert(ctx context.Context, tx riverdriver.E
 			continue
 		}
 		attachments = append(attachments, sequenceruntime.Attachment{
-			ContinueOnCancelled: entry.opts.ContinueOnCancelled,
-			ContinueOnDiscarded: entry.opts.ContinueOnDiscarded,
+			ContinueOnCancelled: ptrutil.ValOrDefault(entry.opts.ContinueOnCancelled, true),
+			ContinueOnDiscarded: ptrutil.ValOrDefault(entry.opts.ContinueOnDiscarded, true),
 			JobID:               results[i].Job.ID,
 			Key:                 entry.key,
 		})

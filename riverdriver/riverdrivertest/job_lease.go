@@ -2,6 +2,7 @@ package riverdrivertest
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,11 +132,17 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 			})
 			require.NoError(t, err)
 			require.Len(t, renewed, 1)
+			require.Equal(t, job.ID, renewed[0].ID)
+			require.NotNil(t, renewed[0].LeaseExpiresAt)
 			require.True(t, renewed[0].LeaseExpiresAt.After(*job.LeaseExpiresAt))
-			require.Equal(t, job.Attempt, renewed[0].Attempt)
-			require.Equal(t, job.AttemptedAt, renewed[0].AttemptedAt)
-			require.Equal(t, job.AttemptedBy, renewed[0].AttemptedBy)
-			require.Equal(t, job.ScheduledAt, renewed[0].ScheduledAt)
+			// Lease confirmations omit job data; inspect storage to verify it is unchanged.
+			stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, renewed[0].LeaseExpiresAt, stored.LeaseExpiresAt)
+			require.Equal(t, job.Attempt, stored.Attempt)
+			require.Equal(t, job.AttemptedAt, stored.AttemptedAt)
+			require.Equal(t, job.AttemptedBy, stored.AttemptedBy)
+			require.Equal(t, job.ScheduledAt, stored.ScheduledAt)
 		})
 
 		t.Run("ClaimLeaseUsesDatabaseClock", func(t *testing.T) {
@@ -547,8 +554,48 @@ func exerciseJobLease[TTx any](ctx context.Context, t *testing.T, driverWithSche
 			require.Len(t, jobs, 1)
 			require.Equal(t, job.ID, jobs[0].ID)
 			require.False(t, jobs[0].LeaseExpiresAt.Before(*stored.LeaseExpiresAt))
-			require.Equal(t, job.AttemptedAt, jobs[0].AttemptedAt)
-			require.Equal(t, job.Attempt, jobs[0].Attempt)
+			stored, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			require.Equal(t, job.AttemptedAt, stored.AttemptedAt)
+			require.Equal(t, job.Attempt, stored.Attempt)
+		})
+
+		t.Run("RenewalReturnsOnlyLeaseConfirmation", func(t *testing.T) {
+			t.Parallel()
+
+			exec, _ := executorWithTx(ctx, t)
+			payload := strings.Repeat("x", 1<<20)
+			inserted := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+				Attempt:     new(2),
+				EncodedArgs: []byte(`{"payload":"` + payload + `"}`),
+				Errors:      [][]byte{[]byte(`{"attempt":1,"at":"2026-10-13T00:00:00Z","error":"previous failure"}`)},
+				Metadata:    []byte(`{"payload":"` + payload + `"}`),
+			})
+			claimed, err := exec.JobGetAvailable(ctx, &riverdriver.JobGetAvailableParams{
+				ClientID: testClientID, LeaseDuration: time.Minute, MaxAttemptedBy: 10, MaxToLock: 1, Queue: inserted.Queue,
+			})
+			require.NoError(t, err)
+			require.Len(t, claimed.Jobs, 1)
+			job := claimed.Jobs[0]
+			require.Equal(t, inserted.ID, job.ID)
+			require.Greater(t, len(job.EncodedArgs), 1<<20)
+			require.Greater(t, len(job.Metadata), 1<<20)
+
+			rows, err := exec.JobRenewLeaseMany(ctx, &riverdriver.JobRenewLeaseManyParams{
+				IDs: []int64{job.ID}, AttemptedAt: []time.Time{*job.AttemptedAt}, Attempts: []int{job.Attempt}, LeaseDuration: 2 * time.Minute,
+			})
+			require.NoError(t, err)
+			require.Len(t, rows, 1)
+			require.NotNil(t, rows[0].LeaseExpiresAt)
+			require.True(t, rows[0].LeaseExpiresAt.After(*job.LeaseExpiresAt))
+			require.Equal(t, &rivertype.JobRow{ID: job.ID, LeaseExpiresAt: rows[0].LeaseExpiresAt}, rows[0])
+
+			// Only lease expiry may change; payload, history, claim, and scheduling stay intact.
+			stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+			require.NoError(t, err)
+			expected := *job
+			expected.LeaseExpiresAt = rows[0].LeaseExpiresAt
+			require.Equal(t, &expected, stored)
 		})
 
 		t.Run("RescueRechecksExpiryAndGrace", func(t *testing.T) {

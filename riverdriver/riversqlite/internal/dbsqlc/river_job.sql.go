@@ -1424,23 +1424,6 @@ WHERE state = 'running'
     )
 RETURNING
     id,
-    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
-    attempt,
-    attempted_at,
-    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
-    created_at,
-    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
-    finalized_at,
-    kind,
-    max_attempts,
-    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
-    priority,
-    queue,
-    state,
-    scheduled_at,
-    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
-    unique_key,
-    unique_states,
     lease_expires_at
 `
 
@@ -1451,23 +1434,6 @@ type JobRenewLeaseManyParams struct {
 
 type JobRenewLeaseManyRow struct {
 	ID             int64
-	Column2        []byte
-	Attempt        int64
-	AttemptedAt    *time.Time
-	Column5        []byte
-	CreatedAt      time.Time
-	Column7        []byte
-	FinalizedAt    *time.Time
-	Kind           string
-	MaxAttempts    int64
-	Column11       []byte
-	Priority       int64
-	Queue          string
-	State          string
-	ScheduledAt    time.Time
-	Column16       []byte
-	UniqueKey      []byte
-	UniqueStates   *int64
 	LeaseExpiresAt *time.Time
 }
 
@@ -1482,27 +1448,7 @@ func (q *Queries) JobRenewLeaseMany(ctx context.Context, db DBTX, arg *JobRenewL
 	var items []*JobRenewLeaseManyRow
 	for rows.Next() {
 		var i JobRenewLeaseManyRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.Column2,
-			&i.Attempt,
-			&i.AttemptedAt,
-			&i.Column5,
-			&i.CreatedAt,
-			&i.Column7,
-			&i.FinalizedAt,
-			&i.Kind,
-			&i.MaxAttempts,
-			&i.Column11,
-			&i.Priority,
-			&i.Queue,
-			&i.State,
-			&i.ScheduledAt,
-			&i.Column16,
-			&i.UniqueKey,
-			&i.UniqueStates,
-			&i.LeaseExpiresAt,
-		); err != nil {
+		if err := rows.Scan(&i.ID, &i.LeaseExpiresAt); err != nil {
 			return nil, err
 		}
 		items = append(items, &i)

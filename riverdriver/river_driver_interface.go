@@ -273,6 +273,7 @@ type Executor interface {
 	JobList(ctx context.Context, params *JobListParams) ([]*rivertype.JobRow, error)
 
 	// JobRenewLeaseMany renews unexpired leases matching the original claim snapshot.
+	// Returned rows contain only ID and LeaseExpiresAt, not full job snapshots.
 	JobRenewLeaseMany(ctx context.Context, params *JobRenewLeaseManyParams) ([]*rivertype.JobRow, error)
 	JobRescueMany(ctx context.Context, params *JobRescueManyParams) (*struct{}, error)
 	JobRetry(ctx context.Context, params *JobRetryParams) (*rivertype.JobRow, error)

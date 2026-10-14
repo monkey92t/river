@@ -415,9 +415,12 @@ func TestSequenceKey(t *testing.T) {
 
 		base, err := sequenceKey("payments", args.Kind(), encoded, SequenceOpts{ByArgs: true}, args)
 		require.NoError(t, err)
-		continued, err := sequenceKey("payments", args.Kind(), encoded, SequenceOpts{ByArgs: true, ContinueOnCancelled: true, ContinueOnDiscarded: true}, args)
+		continued, err := sequenceKey("payments", args.Kind(), encoded, SequenceOpts{ByArgs: true, ContinueOnCancelled: new(true), ContinueOnDiscarded: new(true)}, args)
 		require.NoError(t, err)
 		require.Equal(t, base, continued)
+		stopped, err := sequenceKey("payments", args.Kind(), encoded, SequenceOpts{ByArgs: true, ContinueOnCancelled: new(false), ContinueOnDiscarded: new(false)}, args)
+		require.NoError(t, err)
+		require.Equal(t, base, stopped)
 	})
 
 	t.Run("FullEncodedArgsFallback", func(t *testing.T) {

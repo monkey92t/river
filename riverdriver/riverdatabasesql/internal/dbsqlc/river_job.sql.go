@@ -1364,7 +1364,7 @@ WHERE river_job.id = locked_jobs.id
     AND river_job.attempted_at = lease_input.attempted_at
     AND river_job.attempt = lease_input.attempt
     AND river_job.lease_expires_at > clock_timestamp()
-RETURNING river_job.id, river_job.args, river_job.attempt, river_job.attempted_at, river_job.attempted_by, river_job.created_at, river_job.errors, river_job.finalized_at, river_job.kind, river_job.lease_expires_at, river_job.max_attempts, river_job.metadata, river_job.priority, river_job.queue, river_job.state, river_job.scheduled_at, river_job.tags, river_job.sequence_key, river_job.sequence_position, river_job.sequence_continue_on_cancelled, river_job.sequence_continue_on_discarded, river_job.sequence_resolved_at, river_job.unique_key, river_job.unique_states
+RETURNING river_job.id, river_job.lease_expires_at
 `
 
 type JobRenewLeaseManyParams struct {
@@ -1374,9 +1374,14 @@ type JobRenewLeaseManyParams struct {
 	Attempts      []int64
 }
 
+type JobRenewLeaseManyRow struct {
+	ID             int64
+	LeaseExpiresAt *time.Time
+}
+
 // Match the unchanged claim snapshot so a renewal can be retried when its
 // response is lost. Lock before sampling time to prevent expired lease revival.
-func (q *Queries) JobRenewLeaseMany(ctx context.Context, db DBTX, arg *JobRenewLeaseManyParams) ([]*RiverJob, error) {
+func (q *Queries) JobRenewLeaseMany(ctx context.Context, db DBTX, arg *JobRenewLeaseManyParams) ([]*JobRenewLeaseManyRow, error) {
 	rows, err := db.QueryContext(ctx, jobRenewLeaseMany,
 		arg.LeaseDuration,
 		pq.Array(arg.IDs),
@@ -1387,35 +1392,10 @@ func (q *Queries) JobRenewLeaseMany(ctx context.Context, db DBTX, arg *JobRenewL
 		return nil, err
 	}
 	defer rows.Close()
-	var items []*RiverJob
+	var items []*JobRenewLeaseManyRow
 	for rows.Next() {
-		var i RiverJob
-		if err := rows.Scan(
-			&i.ID,
-			&i.Args,
-			&i.Attempt,
-			&i.AttemptedAt,
-			pq.Array(&i.AttemptedBy),
-			&i.CreatedAt,
-			pq.Array(&i.Errors),
-			&i.FinalizedAt,
-			&i.Kind,
-			&i.LeaseExpiresAt,
-			&i.MaxAttempts,
-			&i.Metadata,
-			&i.Priority,
-			&i.Queue,
-			&i.State,
-			&i.ScheduledAt,
-			pq.Array(&i.Tags),
-			&i.SequenceKey,
-			&i.SequencePosition,
-			&i.SequenceContinueOnCancelled,
-			&i.SequenceContinueOnDiscarded,
-			&i.SequenceResolvedAt,
-			&i.UniqueKey,
-			&i.UniqueStates,
-		); err != nil {
+		var i JobRenewLeaseManyRow
+		if err := rows.Scan(&i.ID, &i.LeaseExpiresAt); err != nil {
 			return nil, err
 		}
 		items = append(items, &i)

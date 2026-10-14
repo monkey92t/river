@@ -278,9 +278,45 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 		)
 		return &jobExecutorResult{Err: &rivertype.UnknownJobKindError{Kind: e.JobRow.Kind}, MetadataUpdates: metadataUpdates}
 	}
+	// Decode before resolving the worker timeout, which may depend on job args.
+	if err := e.WorkUnit.UnmarshalJob(); err != nil {
+		return &jobExecutorResult{Err: err, MetadataUpdates: metadataUpdates}
+	}
+	jobArgsUnmarshaled = true
+	decodedArgs := string(e.JobRow.EncodedArgs)
+
+	// Keep the execution deadline and its watches alive through the entire
+	// middleware chain, including begin hooks and middleware after Work returns.
+	jobTimeout := cmp.Or(e.WorkUnit.Timeout(), e.ClientJobTimeout)
+	// Preserve client retry-policy selection for failures before begin hooks finish.
+	// Early decoding is only preparation for resolving the execution timeout.
+	jobArgsUnmarshaled = false
+	if jobTimeout > 0 {
+		var timeoutCancel context.CancelFunc
+		ctx, timeoutCancel = context.WithTimeout(ctx, jobTimeout)
+		defer timeoutCancel()
+
+		watchStuckCancel := e.watchStuck(ctx, jobTimeout)
+		defer watchStuckCancel()
+	}
+	stopLeaseWatch := e.watchLeaseCancellation(ctx)
+	defer stopLeaseWatch()
+	executionDeadline, hasExecutionDeadline := ctx.Deadline()
+
 	pluginLookupByJob := e.WorkUnit.PluginLookup(e.PluginLookupByJob)
 
 	doInner := execution.Func(func(ctx context.Context) error {
+		// Preserve the original budget if middleware removes or extends its deadline.
+		if hasExecutionDeadline {
+			if deadline, ok := ctx.Deadline(); !ok || deadline.After(executionDeadline) {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, executionDeadline)
+				defer cancel()
+			}
+		}
+		// Middleware may also supply an earlier cancellation than the outer deadline.
+		stopLeaseWatch := e.watchLeaseCancellation(ctx)
+		defer stopLeaseWatch()
 		{
 			for _, hook := range append(
 				e.PluginLookupGlobal.ByKind(pluginlookup.PluginKindHookWorkBegin),
@@ -292,24 +328,17 @@ func (e *JobExecutor) execute(ctx context.Context) (res *jobExecutorResult) {
 			}
 		}
 
-		if err := e.WorkUnit.UnmarshalJob(); err != nil {
-			return err
+		// Middleware and begin hooks may replace or mutate the encoded args.
+		// Refresh Work's typed arguments without restarting the execution budget.
+		if string(e.JobRow.EncodedArgs) != decodedArgs {
+			jobArgsUnmarshaled = false
+			if err := e.WorkUnit.UnmarshalJob(); err != nil {
+				return err
+			}
+			jobArgsUnmarshaled = true
+			decodedArgs = string(e.JobRow.EncodedArgs)
 		}
 		jobArgsUnmarshaled = true
-
-		jobTimeout := cmp.Or(e.WorkUnit.Timeout(), e.ClientJobTimeout)
-
-		if jobTimeout > 0 {
-			var timeoutCancel context.CancelFunc
-			ctx, timeoutCancel = context.WithTimeout(ctx, jobTimeout)
-			defer timeoutCancel()
-
-			watchStuckCancel := e.watchStuck(ctx, jobTimeout)
-			defer watchStuckCancel()
-		}
-
-		stopLeaseWatch := e.watchLeaseCancellation(ctx)
-		defer stopLeaseWatch()
 		if err := joblease.FromContext(ctx).Check(); err != nil {
 			return err
 		}

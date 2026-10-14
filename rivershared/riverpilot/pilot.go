@@ -128,6 +128,7 @@ type PilotJobDeleter interface {
 // PilotJobLease identifies pilots that preserve lease acquisition and completion
 // semantics and support renewal. Clients reject lease mode without this capability.
 type PilotJobLease interface {
+	// JobRenewLeaseMany returns lease confirmations with only ID and LeaseExpiresAt.
 	JobRenewLeaseMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error)
 }
 

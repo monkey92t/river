@@ -1969,8 +1969,8 @@ func ExerciseClient[TTx any](ctx context.Context, t *testing.T,
 // sequenceClientArgs keeps policy and payload outside the grouping fingerprint.
 type sequenceClientArgs struct {
 	Account   string `json:"account"   river:"sequence"`
-	Cancel    bool   `json:"cancel"`
-	Discard   bool   `json:"discard"`
+	Cancel    *bool  `json:"cancel"`
+	Discard   *bool  `json:"discard"`
 	Operation int    `json:"operation"`
 }
 
@@ -2115,8 +2115,8 @@ func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
 				t.Parallel()
 
 				bundle := postgres(t)
-				first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: continued}, nil)
-				second := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: !continued, Operation: 2}, nil)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: new(continued)}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: new(!continued), Operation: 2}, nil)
 				_, err := bundle.client.JobCancel(ctx, first.ID)
 				require.NoError(t, err)
 				reconcile(t, bundle, *first.SequenceKey)
@@ -2143,8 +2143,8 @@ func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
 				t.Parallel()
 
 				bundle := postgres(t)
-				first := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: continued}, nil)
-				second := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: !continued, Operation: 2}, nil)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: new(continued)}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Discard: new(!continued), Operation: 2}, nil)
 				reconcile(t, bundle, *first.SequenceKey)
 				require.Len(t, claim(t, bundle), 1)
 				sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateDiscarded(first.ID, time.Now(), nil, nil))
@@ -2165,7 +2165,7 @@ func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
 			t.Parallel()
 
 			bundle := postgres(t)
-			first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: true}, nil)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: new(true)}, nil)
 			_, err := bundle.client.JobCancel(ctx, first.ID)
 			require.NoError(t, err)
 			params := &riverdriver.JobDeleteBeforeParams{CancelledDoDelete: true, CancelledFinalizedAtHorizon: time.Now().Add(time.Hour), Max: 100, Schema: bundle.schema}
@@ -2237,11 +2237,113 @@ func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
 			require.Len(t, claim(t, bundle), 1)
 		})
 
+		// Default nonterminal outcomes retain the head even when its next run is later.
+		for _, outcome := range []string{"Retry", "Snooze"} {
+			t.Run("DefaultNonterminalPolicy/"+outcome, func(t *testing.T) {
+				t.Parallel()
+
+				bundle := postgres(t)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+				key := *first.SequenceKey
+				reconcile(t, bundle, key)
+				jobs := claim(t, bundle)
+				require.Len(t, jobs, 1)
+				require.Equal(t, first.ID, jobs[0].ID)
+				_, err := bundle.client.JobDelete(ctx, first.ID)
+				require.ErrorIs(t, err, rivertype.ErrJobRunning)
+
+				future := time.Now().Add(time.Hour)
+				if outcome == "Retry" {
+					sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateErrorRetryable(first.ID, future, []byte(`{"error":"transient"}`), nil))
+					state(t, bundle, first.ID, rivertype.JobStateRetryable)
+				} else {
+					sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateSnoozed(first.ID, future, jobs[0].Attempt-1, nil))
+					state(t, bundle, first.ID, rivertype.JobStateScheduled)
+				}
+				reconcile(t, bundle, key)
+				state(t, bundle, second.ID, rivertype.JobStatePending)
+				require.Empty(t, claim(t, bundle))
+
+				// Retry the head immediately, then verify only its success releases the tail.
+				_, err = bundle.client.JobRetry(ctx, first.ID)
+				require.NoError(t, err)
+				reconcile(t, bundle, key)
+				jobs = claim(t, bundle)
+				require.Len(t, jobs, 1)
+				require.Equal(t, first.ID, jobs[0].ID)
+				sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateCompleted(first.ID, time.Now(), nil))
+				reconcile(t, bundle, key)
+				state(t, bundle, second.ID, rivertype.JobStateAvailable)
+			})
+		}
+
+		// Deletion must allow progress regardless of whether reconciliation saw the terminal head.
+		for _, test := range []struct {
+			name                  string
+			state                 rivertype.JobState
+			deleteHead            bool
+			reconcileBeforeDelete bool
+		}{
+			{"Cancelled", rivertype.JobStateCancelled, false, false},
+			{"DeletedAvailable", rivertype.JobStateAvailable, true, false},
+			{"DeletedCancelledAfterReconcile", rivertype.JobStateCancelled, true, true},
+			{"DeletedCancelledBeforeReconcile", rivertype.JobStateCancelled, true, false},
+			{"DeletedDiscardedAfterReconcile", rivertype.JobStateDiscarded, true, true},
+			{"DeletedDiscardedBeforeReconcile", rivertype.JobStateDiscarded, true, false},
+			{"Discarded", rivertype.JobStateDiscarded, false, false},
+		} {
+			t.Run("DefaultTerminalPolicy/"+test.name, func(t *testing.T) {
+				t.Parallel()
+
+				bundle := postgres(t)
+				first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+				second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
+				require.True(t, *first.SequenceContinueOnCancelled)
+				require.True(t, *first.SequenceContinueOnDiscarded)
+				key := *first.SequenceKey
+				reconcile(t, bundle, key)
+				switch test.state {
+				case rivertype.JobStateAvailable:
+					state(t, bundle, first.ID, rivertype.JobStateAvailable)
+				case rivertype.JobStateCancelled:
+					_, err := bundle.client.JobCancel(ctx, first.ID)
+					require.NoError(t, err)
+				case rivertype.JobStateDiscarded:
+					jobs := claim(t, bundle)
+					require.Len(t, jobs, 1)
+					require.Equal(t, first.ID, jobs[0].ID)
+					sequenceSetState(ctx, t, bundle.exec, bundle.schema, riverdriver.JobSetStateDiscarded(first.ID, time.Now(), nil, nil))
+				case rivertype.JobStateCompleted, rivertype.JobStatePending, rivertype.JobStateRetryable, rivertype.JobStateRunning, rivertype.JobStateScheduled:
+					t.Fatalf("unsupported terminal policy fixture: %s", test.state)
+				default:
+					t.Fatalf("unsupported terminal policy fixture: %s", test.state)
+				}
+				if test.deleteHead {
+					if test.reconcileBeforeDelete {
+						reconcile(t, bundle, key)
+					}
+					_, err := bundle.client.JobDelete(ctx, first.ID)
+					require.NoError(t, err)
+					_, err = bundle.client.JobGet(ctx, first.ID)
+					require.ErrorIs(t, err, rivertype.ErrNotFound)
+				}
+				reconcile(t, bundle, key)
+				state(t, bundle, second.ID, rivertype.JobStateAvailable)
+				info, err := bundle.client.SequenceGet(ctx, key)
+				require.NoError(t, err)
+				require.Equal(t, "ordered", info.Mode)
+				jobs := claim(t, bundle)
+				require.Len(t, jobs, 1)
+				require.Equal(t, second.ID, jobs[0].ID)
+			})
+		}
+
 		t.Run("DeletedBarrierRequiresResume", func(t *testing.T) {
 			t.Parallel()
 
 			bundle := postgres(t)
-			first := insert(t, bundle, sequenceClientArgs{Account: "a"}, nil)
+			first := insert(t, bundle, sequenceClientArgs{Account: "a", Cancel: new(false)}, nil)
 			second := insert(t, bundle, sequenceClientArgs{Account: "a", Operation: 2}, nil)
 			_, err := bundle.client.JobCancel(ctx, first.ID)
 			require.NoError(t, err)
@@ -2458,7 +2560,7 @@ func exerciseClientSequences[TTx any](ctx context.Context, t *testing.T,
 			const count = 75
 			params := make([]river.InsertManyParams, count)
 			for index := range count {
-				params[index] = river.InsertManyParams{Args: sequenceClientArgs{Account: "a", Cancel: true, Operation: index}}
+				params[index] = river.InsertManyParams{Args: sequenceClientArgs{Account: "a", Cancel: new(true), Operation: index}}
 			}
 			jobs, err := bundle.client.InsertMany(ctx, params)
 			require.NoError(t, err)

@@ -2,7 +2,6 @@ package joblease
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -27,7 +26,7 @@ type Manager struct {
 	blocked atomic.Bool
 	failed  atomic.Bool
 	mu      sync.Mutex
-	entries map[*Guard]*managerEntry
+	entries map[int64]*managerEntry
 }
 
 // NewManager constructs a manager without starting renewal goroutines.
@@ -36,7 +35,7 @@ func NewManager(archetype *baseservice.Archetype, config *Config, schema string,
 		config:    config,
 		renewFunc: renewFunc,
 		schema:    schema,
-		entries:   make(map[*Guard]*managerEntry),
+		entries:   make(map[int64]*managerEntry),
 	})
 }
 
@@ -50,20 +49,23 @@ func (m *Manager) CanFetch() bool {
 
 // Register begins local supervision using the request's monotonic send time.
 // The database's claim record is retained for renewal, never as a local clock.
-func (m *Manager) Register(job *rivertype.JobRow, sentAt time.Time, cancel context.CancelCauseFunc) *Guard {
+// Conflicting claim records are checked against the database, never ordered by
+// their timestamps or retry counts, before replacing an existing local guard.
+// Conflict checks inherit the execution context and are bounded by RenewTimeout.
+func (m *Manager) Register(ctx context.Context, job *rivertype.JobRow, sentAt time.Time, cancel context.CancelCauseFunc) *Guard {
 	guard := NewGuard(sentAt.Add(m.config.LeaseDuration-m.config.LocalSafetyMargin), cancel)
 	if job.LeaseExpiresAt == nil || job.AttemptedAt == nil {
 		// A pilot must return both the acquired lease and its claim record.
 		guard.Abandon()
 	} else {
-		m.mu.Lock()
-		m.entries[guard] = &managerEntry{id: job.ID, attempt: job.Attempt, attemptedAt: *job.AttemptedAt, guard: guard}
-		m.mu.Unlock()
+		m.register(ctx, &managerEntry{id: job.ID, attempt: job.Attempt, attemptedAt: *job.AttemptedAt, guard: guard})
 	}
 	go func() {
 		<-guard.Done()
 		m.mu.Lock()
-		delete(m.entries, guard)
+		if entry := m.entries[job.ID]; entry != nil && entry.guard == guard {
+			delete(m.entries, job.ID)
+		}
 		if len(m.entries) == 0 {
 			// Let normal acquisition probe database recovery when nothing remains.
 			m.failed.Store(false)
@@ -103,8 +105,8 @@ func (m *Manager) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				m.mu.Lock()
 				guards := make([]*Guard, 0, len(m.entries))
-				for guard := range m.entries {
-					guards = append(guards, guard)
+				for _, entry := range m.entries {
+					guards = append(guards, entry.guard)
 				}
 				m.mu.Unlock()
 				for _, guard := range guards {
@@ -127,12 +129,86 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// renew performs one bounded batch. Failed or ambiguous requests never extend guards.
+// confirmClaim uses the existing fenced renewal to validate a conflicting claim.
+// The request is bounded and cannot revive a guard that expired while waiting.
+func (m *Manager) confirmClaim(ctx context.Context, entry *managerEntry) bool {
+	ctx, release, err := entry.guard.Begin(ctx)
+	if err != nil {
+		return false
+	}
+	defer release()
+	sentAt := time.Now()
+	rows, err := m.renewFunc(ctx, &riverdriver.JobRenewLeaseManyParams{
+		IDs: []int64{entry.id}, AttemptedAt: []time.Time{entry.attemptedAt}, Attempts: []int{entry.attempt},
+		LeaseDuration: m.config.LeaseDuration, Schema: m.schema,
+	})
+	if err != nil {
+		m.failed.Store(true)
+		m.Logger.WarnContext(ctx, "Job lease claim confirmation failed", slog.Int64("job_id", entry.id), slog.String("error", err.Error()))
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	for _, row := range rows {
+		if row.ID == entry.id && row.LeaseExpiresAt != nil {
+			return entry.guard.Renew(sentAt.Add(m.config.LeaseDuration - m.config.LocalSafetyMargin))
+		}
+	}
+	return false
+}
+
+// register replaces an overlapping guard only after its incoming claim is confirmed.
+// Confirmation runs without the manager lock so other jobs can keep renewing.
+func (m *Manager) register(ctx context.Context, entry *managerEntry) {
+	if ctx.Err() != nil {
+		entry.guard.Abandon()
+		return
+	}
+	m.mu.Lock()
+	previous := m.entries[entry.id]
+	if previous == nil {
+		m.entries[entry.id] = entry
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	// One budget bounds the entire registration, including rechecks after
+	// another registration wins the local slot while a reply is delayed.
+	ctx, cancel := context.WithTimeout(ctx, m.config.RenewTimeout)
+	defer cancel()
+	for {
+		if previous != nil && previous.attempt == entry.attempt && previous.attemptedAt.Equal(entry.attemptedAt) {
+			entry.guard.Abandon()
+			return
+		}
+		if ctx.Err() != nil || !m.confirmClaim(ctx, entry) {
+			entry.guard.Abandon()
+			return
+		}
+		m.mu.Lock()
+		if m.entries[entry.id] != previous {
+			previous = m.entries[entry.id]
+			m.mu.Unlock()
+			continue
+		}
+		m.entries[entry.id] = entry
+		m.mu.Unlock()
+		if previous != nil {
+			previous.guard.Abandon()
+		}
+		return
+	}
+}
+
+// renew performs one bounded batch owned by the client, not any single member.
+// A member lost after admission may receive one last database renewal, but its
+// guard cannot revive. Failed or ambiguous requests never extend guards.
 func (m *Manager) renew(ctx context.Context) error {
 	m.mu.Lock()
 	entries := make([]managerEntry, 0, len(m.entries))
-	for guard, entry := range m.entries {
-		if guard.Check() == nil {
+	for _, entry := range m.entries {
+		if entry.guard.Check() == nil {
 			entries = append(entries, *entry)
 		}
 	}
@@ -146,19 +222,9 @@ func (m *Manager) renew(ctx context.Context) error {
 	params := &riverdriver.JobRenewLeaseManyParams{LeaseDuration: m.config.LeaseDuration, Schema: m.schema}
 	active := entries[:0]
 	for _, entry := range entries {
-		requestCtx, release, err := entry.guard.Begin(ctx)
-		if err != nil {
+		if entry.guard.Check() != nil {
 			continue
 		}
-		defer release()
-		// Lease loss cancels an in-flight batch, but normal completion of one
-		// member must not interrupt renewal of the remaining executions.
-		stop := context.AfterFunc(requestCtx, func() {
-			if errors.Is(context.Cause(requestCtx), rivertype.ErrJobLeaseLost) {
-				cancel()
-			}
-		})
-		defer stop()
 		active = append(active, entry)
 		params.IDs = append(params.IDs, entry.id)
 		params.AttemptedAt = append(params.AttemptedAt, entry.attemptedAt)
@@ -185,7 +251,13 @@ func (m *Manager) renew(ctx context.Context) error {
 			// result arrives; a missing renewal never grants additional time.
 			continue
 		}
-		entry.guard.Renew(sentAt.Add(m.config.LeaseDuration - m.config.LocalSafetyMargin))
+		// Receipts contain only IDs, so bind them to this request's captured
+		// guard, never to another claim registered while the request was in flight.
+		m.mu.Lock()
+		if current := m.entries[entry.id]; current != nil && current.guard == entry.guard {
+			entry.guard.Renew(sentAt.Add(m.config.LeaseDuration - m.config.LocalSafetyMargin))
+		}
+		m.mu.Unlock()
 	}
 	return nil
 }

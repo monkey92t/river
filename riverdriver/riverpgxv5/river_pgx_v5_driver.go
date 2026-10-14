@@ -643,6 +643,7 @@ func (e *Executor) JobList(ctx context.Context, params *riverdriver.JobListParam
 }
 
 // JobRenewLeaseMany renews unexpired leases matching the original claim snapshot.
+// Returned rows contain only ID and LeaseExpiresAt.
 func (e *Executor) JobRenewLeaseMany(ctx context.Context, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
 	if len(params.IDs) != len(params.AttemptedAt) || len(params.IDs) != len(params.Attempts) || params.LeaseDuration <= 0 {
 		return nil, errors.New("lease renewal requires matching IDs, attempt times, and attempts and a positive duration")
@@ -656,7 +657,9 @@ func (e *Executor) JobRenewLeaseMany(ctx context.Context, params *riverdriver.Jo
 	if err != nil {
 		return nil, interpretError(err)
 	}
-	return jobRowsFromInternalPartial(jobs), nil
+	return sliceutil.Map(jobs, func(job *dbsqlc.JobRenewLeaseManyRow) *rivertype.JobRow {
+		return &rivertype.JobRow{ID: job.ID, LeaseExpiresAt: job.LeaseExpiresAt}
+	}), nil
 }
 
 func (e *Executor) JobRescueMany(ctx context.Context, params *riverdriver.JobRescueManyParams) (*struct{}, error) {

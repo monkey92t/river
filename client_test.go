@@ -2046,50 +2046,63 @@ func Test_Client_Common(t *testing.T) {
 	t.Run("MiddlewareModifiesEncodedArgs", func(t *testing.T) {
 		t.Parallel()
 
-		_, bundle := setup(t)
-		middlewareCalled := false
+		for _, inPlace := range []bool{false, true} {
+			t.Run(fmt.Sprintf("InPlace=%t", inPlace), func(t *testing.T) {
+				t.Parallel()
 
-		type JobArgs struct {
-			testutil.JobArgsReflectKind[JobArgs]
+				_, bundle := setup(t)
+				middlewareCalled := false
 
-			Name string `json:"name"`
-		}
+				type JobArgs struct {
+					testutil.JobArgsReflectKind[JobArgs]
 
-		worker := &workerWithMiddleware[JobArgs]{
-			workFunc: func(ctx context.Context, job *Job[JobArgs]) error {
-				require.Equal(t, "middleware name", job.Args.Name)
-				return nil
-			},
-			middlewareFunc: func(job *rivertype.JobRow) []rivertype.WorkerMiddleware {
-				return []rivertype.WorkerMiddleware{
-					&overridableJobMiddleware{
-						workFunc: func(ctx context.Context, job *rivertype.JobRow, doInner func(ctx context.Context) error) error {
-							middlewareCalled = true
-							require.JSONEq(t, `{"name": "inserted name"}`, string(job.EncodedArgs))
-							job.EncodedArgs = []byte(`{"name": "middleware name"}`)
-							return doInner(ctx)
-						},
+					Name string `json:"name"`
+				}
+
+				worker := &workerWithMiddleware[JobArgs]{
+					workFunc: func(ctx context.Context, job *Job[JobArgs]) error {
+						require.Equal(t, "modified name", job.Args.Name)
+						return nil
+					},
+					middlewareFunc: func(job *rivertype.JobRow) []rivertype.WorkerMiddleware {
+						return []rivertype.WorkerMiddleware{
+							&overridableJobMiddleware{
+								workFunc: func(ctx context.Context, job *rivertype.JobRow, doInner func(ctx context.Context) error) error {
+									middlewareCalled = true
+									require.JSONEq(t, `{"name": "inserted name"}`, string(job.EncodedArgs))
+									encodedArgs := []byte(strings.Replace(string(job.EncodedArgs), "inserted name", "modified name", 1))
+									if inPlace {
+										// Detect mutations that retain the original slice and backing array.
+										require.Len(t, job.EncodedArgs, len(encodedArgs))
+										copy(job.EncodedArgs, encodedArgs)
+									} else {
+										job.EncodedArgs = encodedArgs
+									}
+									return doInner(ctx)
+								},
+							},
+						}
 					},
 				}
-			},
+
+				AddWorker(bundle.config.Workers, worker)
+
+				driver := riverpgxv5.New(bundle.dbPool)
+				client, err := NewClient(driver, bundle.config)
+				require.NoError(t, err)
+
+				subscribeChan := subscribe(t, client)
+				startClient(ctx, t, client)
+
+				result, err := client.Insert(ctx, JobArgs{Name: "inserted name"}, nil)
+				require.NoError(t, err)
+
+				event := riversharedtest.WaitOrTimeout(t, subscribeChan)
+				require.Equal(t, EventKindJobCompleted, event.Kind)
+				require.Equal(t, result.Job.ID, event.Job.ID)
+				require.True(t, middlewareCalled)
+			})
 		}
-
-		AddWorker(bundle.config.Workers, worker)
-
-		driver := riverpgxv5.New(bundle.dbPool)
-		client, err := NewClient(driver, bundle.config)
-		require.NoError(t, err)
-
-		subscribeChan := subscribe(t, client)
-		startClient(ctx, t, client)
-
-		result, err := client.Insert(ctx, JobArgs{Name: "inserted name"}, nil)
-		require.NoError(t, err)
-
-		event := riversharedtest.WaitOrTimeout(t, subscribeChan)
-		require.Equal(t, EventKindJobCompleted, event.Kind)
-		require.Equal(t, result.Job.ID, event.Job.ID)
-		require.True(t, middlewareCalled)
 	})
 
 	t.Run("NotifyRequestResign", func(t *testing.T) {

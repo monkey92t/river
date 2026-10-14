@@ -568,7 +568,7 @@ WHERE river_job.id = locked_jobs.id
     AND river_job.attempted_at = lease_input.attempted_at
     AND river_job.attempt = lease_input.attempt
     AND river_job.lease_expires_at > clock_timestamp()
-RETURNING river_job.*;
+RETURNING river_job.id, river_job.lease_expires_at;
 
 -- Run by the rescuer to queue for retry or discard depending on job state.
 -- name: JobRescueMany :exec

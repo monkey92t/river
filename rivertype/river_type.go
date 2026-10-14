@@ -455,6 +455,8 @@ type HookWorkBegin interface {
 
 	// WorkBegin is invoked after a job has been locked and assigned to a
 	// particular executor for work and just before the job is actually worked.
+	// Job arguments have already been decoded, and ctx carries the execution
+	// deadline shared with worker middleware, Work, and WorkEnd hooks.
 	//
 	// Returning an error from any HookWorkBegin hook will abort the job early
 	// such that it has an error set and doesn't work, with a retry scheduled

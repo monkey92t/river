@@ -56,6 +56,7 @@ func (p *StandardPilot) JobInsertMany(
 }
 
 // JobRenewLeaseMany renews only the running leases still held by this client.
+// Returned rows contain only ID and LeaseExpiresAt.
 func (p *StandardPilot) JobRenewLeaseMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRenewLeaseManyParams) ([]*rivertype.JobRow, error) {
 	return exec.JobRenewLeaseMany(ctx, params)
 }
